@@ -1,0 +1,12 @@
+services:
+  docker-buddy:
+    image: docker-buddy:latest
+    build: .
+    ports:
+      - "7070:7070"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /:/host:ro
+    environment:
+      - HOST_ROOT=/host
+    restart: unless-stopped
