@@ -5,12 +5,15 @@ from fastapi.middleware.cors import CORSMiddleware
 import docker
 import subprocess
 import json
+import re
 import yaml
 import os
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
+
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
 app = FastAPI(title="Docker Buddy", version="1.0.0")
 
@@ -69,6 +72,88 @@ def list_images():
             })
 
     return sorted(images, key=lambda x: x["repository"].lower())
+
+
+# ── Containers ───────────────────────────────────────────────────────────────
+
+@app.get("/api/containers")
+def list_containers():
+    client = docker_client()
+    containers = []
+    for c in client.containers.list(all=True):
+        attrs = c.attrs
+        state = attrs.get("State", {})
+        ports = []
+        for container_port, bindings in (attrs.get("NetworkSettings", {}).get("Ports") or {}).items():
+            if not bindings:
+                continue
+            for b in bindings:
+                host_port = b.get("HostPort", "")
+                if host_port:
+                    entry = f"{host_port}:{container_port}"
+                    if entry not in ports:
+                        ports.append(entry)
+
+        containers.append({
+            "id": c.short_id,
+            "name": c.name,
+            "image": c.image.tags[0] if c.image.tags else (attrs.get("Config", {}).get("Image", "")),
+            "status": c.status,
+            "state": state.get("Status", c.status),
+            "started_at": state.get("StartedAt", ""),
+            "ports": ports,
+        })
+
+    return sorted(containers, key=lambda x: x["name"].lower())
+
+
+@app.get("/api/containers/{container_id}/logs")
+def get_container_logs(container_id: str, tail: int = 300):
+    client = docker_client()
+    try:
+        container = client.containers.get(container_id)
+    except docker.errors.NotFound:
+        raise HTTPException(status_code=404, detail="Container not found")
+
+    try:
+        logs = container.logs(tail=tail, timestamps=False, stdout=True, stderr=True)
+    except docker.errors.APIError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    text = logs.decode("utf-8", errors="replace")
+    return {"logs": ANSI_RE.sub("", text)}
+
+
+@app.post("/api/containers/{container_id}/stop")
+def stop_container(container_id: str):
+    client = docker_client()
+    try:
+        container = client.containers.get(container_id)
+    except docker.errors.NotFound:
+        raise HTTPException(status_code=404, detail="Container not found")
+
+    try:
+        container.stop()
+    except docker.errors.APIError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"success": True}
+
+
+@app.post("/api/containers/{container_id}/start")
+def start_container(container_id: str):
+    client = docker_client()
+    try:
+        container = client.containers.get(container_id)
+    except docker.errors.NotFound:
+        raise HTTPException(status_code=404, detail="Container not found")
+
+    try:
+        container.start()
+    except docker.errors.APIError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"success": True}
 
 
 # ── Stacks ───────────────────────────────────────────────────────────────────

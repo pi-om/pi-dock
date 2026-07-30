@@ -40,6 +40,13 @@ const API = {
     },
   },
 
+  containers: {
+    list: () => API.get('/api/containers'),
+    logs: (id, tail = 300) => API.get(`/api/containers/${encodeURIComponent(id)}/logs?tail=${tail}`),
+    stop: (id) => API.post(`/api/containers/${encodeURIComponent(id)}/stop`, {}),
+    start: (id) => API.post(`/api/containers/${encodeURIComponent(id)}/start`, {}),
+  },
+
   stacks: {
     list: () => API.get('/api/stacks'),
     get: (name) => API.get(`/api/stacks/${encodeURIComponent(name)}`),

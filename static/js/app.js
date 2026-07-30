@@ -293,6 +293,158 @@ function imgRow(img) {
     </tr>`;
 }
 
+// ── Containers Page ───────────────────────────────────────────────────────────
+
+async function renderContainers() {
+  setActiveNav('containers');
+  setTopbar('Containers', 'All Docker containers on this host');
+
+  const body = $('#page-body');
+  body.innerHTML = `<div class="loading-state"><div class="spinner"></div>Loading containers…</div>`;
+
+  let containers;
+  try { containers = await API.containers.list(); }
+  catch (e) { body.innerHTML = errorState(e.message); return; }
+
+  if (containers.length === 0) {
+    body.innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon">📦</div>
+      <h3>No containers found</h3><p>Run a container to see it here.</p>
+    </div>`;
+    return;
+  }
+
+  body.innerHTML = `
+    <div class="table-wrap">
+      <div class="table-toolbar">
+        <span class="table-toolbar-title">Containers <span class="tag tag-default" style="margin-left:6px">${containers.length}</span></span>
+        <input class="search-input" id="ctr-search" placeholder="Search containers…" />
+        <button class="btn btn-ghost btn-sm" onclick="renderContainers()">⟳ Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Image</th>
+            <th>Status</th>
+            <th>Ports</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="ctr-tbody">
+          ${containers.map(containerRow).join('')}
+        </tbody>
+      </table>
+    </div>`;
+
+  $('#ctr-search').addEventListener('input', (e) => {
+    const q = e.target.value.toLowerCase();
+    $$('#ctr-tbody tr').forEach(tr => {
+      tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+  });
+}
+
+function containerRow(c) {
+  const color = statusColor(c.state);
+  const label = statusLabel(c.state);
+  const isRunning = color === 'green';
+  return `
+    <tr>
+      <td>
+        <span class="mono">${escHtml(c.name)}</span>
+        <br><span class="text-muted mono" style="font-size:10px">${escHtml(c.id)}</span>
+      </td>
+      <td><span class="mono text-muted" title="${escHtml(c.image)}">${escHtml(c.image)}</span></td>
+      <td>
+        <span class="status-dot">
+          <span class="dot dot-${color}"></span>
+          <span class="text-${color === 'gray' ? 'muted' : color}">${label}</span>
+        </span>
+      </td>
+      <td><span class="text-muted">${c.ports.length ? escHtml(c.ports.join(', ')) : '—'}</span></td>
+      <td>
+        <div class="flex gap-2" style="justify-content:flex-end">
+          <button class="btn btn-ghost btn-sm" onclick="openContainerLogs('${escHtml(c.id)}', '${escHtml(c.name)}')">
+            Logs
+          </button>
+          ${isRunning
+            ? `<button class="btn btn-danger btn-sm" onclick="confirmStopContainer('${escHtml(c.id)}', '${escHtml(c.name)}')">Stop</button>`
+            : `<button class="btn btn-primary btn-sm" onclick="doStartContainer('${escHtml(c.id)}', '${escHtml(c.name)}')">Start</button>`
+          }
+        </div>
+      </td>
+    </tr>`;
+}
+
+async function openContainerLogs(id, name) {
+  const modal = Modal.open(`
+    <div class="modal-header">
+      <span class="modal-title">Logs — ${escHtml(name)}</span>
+      <button class="btn-icon" onclick="Modal.close()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="pull-output" id="ctr-log-view" style="max-height:420px">Loading logs…</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="openContainerLogs('${escHtml(id)}','${escHtml(name)}')">⟳ Refresh</button>
+      <button class="btn btn-primary" onclick="Modal.close()">Close</button>
+    </div>
+  `);
+
+  try {
+    const res = await API.containers.logs(id);
+    const view = $('#ctr-log-view');
+    if (view) {
+      view.textContent = res.logs || '(no output)';
+      view.scrollTop = view.scrollHeight;
+    }
+  } catch (e) {
+    const view = $('#ctr-log-view');
+    if (view) view.textContent = `Failed to load logs: ${e.message}`;
+  }
+}
+
+function confirmStopContainer(id, name) {
+  Modal.open(`
+    <div class="modal-header">
+      <span class="modal-title">Stop Container</span>
+      <button class="btn-icon" onclick="Modal.close()">✕</button>
+    </div>
+    <div class="modal-body">
+      <p style="font-size:13px">Stop <strong>${escHtml(name)}</strong>? It will no longer be running until started again.</p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
+      <button class="btn btn-danger" id="stop-ctr-btn" onclick="doStopContainer('${escHtml(id)}', '${escHtml(name)}')">Stop Container</button>
+    </div>
+  `);
+}
+
+async function doStopContainer(id, name) {
+  const btn = $('#stop-ctr-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
+  try {
+    await API.containers.stop(id);
+    Toast.success(`Stopped ${name}`);
+    Modal.close();
+    renderContainers();
+  } catch (e) {
+    Toast.error(e.message);
+    if (btn) { btn.disabled = false; btn.textContent = 'Stop Container'; }
+  }
+}
+
+async function doStartContainer(id, name) {
+  try {
+    await API.containers.start(id);
+    Toast.success(`Started ${name}`);
+    renderContainers();
+  } catch (e) {
+    Toast.error(e.message);
+  }
+}
+
 // ── Stacks List Page ──────────────────────────────────────────────────────────
 
 async function renderStacks() {
@@ -970,6 +1122,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Routes
   Router.on('/',             () => renderDashboard());
   Router.on('/images',       () => renderImages());
+  Router.on('/containers',   () => renderContainers());
   Router.on('/stacks',       () => renderStacks());
   Router.on('/stacks/:name', (p) => renderStackDetail(p));
 
