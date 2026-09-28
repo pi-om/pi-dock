@@ -680,6 +680,19 @@ tbody td {
 }
 
 .service-row:last-child { border-bottom: none; }
+.service-row-link { cursor: pointer; }
+
+.kv-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 24px;
+  padding: 14px 18px;
+  font-size: 12.5px;
+}
+.kv-key { color: var(--text-muted); font-weight: 600; }
+.kv-val { color: var(--text); word-break: break-all; white-space: pre-wrap; }
+
+tr.row-highlight td { background: #f5f7ff; }
 .service-row:hover { background: #f5f7ff; }
 
 .service-name {

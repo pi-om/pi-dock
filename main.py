@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import docker
 import subprocess
 import json
@@ -312,6 +313,26 @@ def get_stack(stack_name: str):
     for svc_name, svc_cfg in (compose_data.get("services") or {}).items():
         service_images[svc_name] = svc_cfg.get("image", "")
 
+    # Compose file unreadable from here (relative path, other user's home…):
+    # fall back to the project's containers, found by their compose labels
+    if not services:
+        client = docker_client()
+        for c in client.containers.list(all=True, filters={"label": f"com.docker.compose.project={stack_name}"}):
+            svc_name = c.labels.get("com.docker.compose.service", c.name)
+            ports = c.attrs.get("NetworkSettings", {}).get("Ports") or {}
+            services.append({
+                "Service": svc_name,
+                "State": c.attrs.get("State", {}).get("Status", c.status),
+                "Publishers": [
+                    {"PublishedPort": int(host), "TargetPort": int(target)}
+                    for host, target in sorted({
+                        (b["HostPort"], cp.split("/")[0])
+                        for cp, binds in ports.items() for b in (binds or []) if b.get("HostPort")
+                    })
+                ],
+            })
+            service_images.setdefault(svc_name, c.attrs.get("Config", {}).get("Image", ""))
+
     return {
         "name": stack_name,
         "type": "compose",
@@ -319,6 +340,125 @@ def get_stack(stack_name: str):
         "status": stack.get("Status", ""),
         "services": services,
         "service_images": service_images,
+    }
+
+
+@app.get("/api/stacks/{stack_name}/services/{service_name}")
+def get_stack_service(stack_name: str, service_name: str):
+    stack = find_stack(stack_name)
+    if stack.get("Type") == "swarm":
+        return get_swarm_service_detail(stack_name, service_name)
+    return get_compose_service_detail(stack, service_name)
+
+
+def strip_digest(image: str) -> str:
+    return (image or "").split("@sha256:")[0]
+
+
+def get_swarm_service_detail(stack_name: str, service_name: str):
+    client = docker_client()
+    full_name = f"{stack_name}_{service_name}"
+    try:
+        svc = client.api.inspect_service(full_name)
+    except docker.errors.NotFound:
+        raise HTTPException(status_code=404, detail="Service not found in stack")
+
+    spec = svc.get("Spec", {})
+    task_tpl = spec.get("TaskTemplate", {})
+    container_spec = task_tpl.get("ContainerSpec", {})
+    prev_image = (svc.get("PreviousSpec") or {}).get("TaskTemplate", {}).get("ContainerSpec", {}).get("Image", "")
+    if strip_digest(prev_image) == strip_digest(container_spec.get("Image", "")):
+        prev_image = ""
+    mode = spec.get("Mode", {})
+    replicas = next((s["Replicas"] for s in get_swarm_services(stack_name) if s["Name"] == full_name), "")
+
+    # Swarm keeps a few past tasks per slot; their containers may already be pruned
+    existing = {c.id for c in client.containers.list(all=True, filters={"label": f"com.docker.swarm.service.name={full_name}"})}
+    tasks = sorted(client.api.tasks(filters={"service": full_name}), key=lambda t: t.get("CreatedAt", ""), reverse=True)
+
+    containers = []
+    for t in tasks:
+        status = t.get("Status", {})
+        cstatus = status.get("ContainerStatus", {})
+        cid = cstatus.get("ContainerID", "")
+        containers.append({
+            "task_id": t.get("ID", "")[:12],
+            "container_id": cid,
+            "name": f"{full_name}.{t.get('Slot') or t.get('NodeID', '')[:6]}",
+            "image": strip_digest(t.get("Spec", {}).get("ContainerSpec", {}).get("Image", "")),
+            "state": status.get("State", ""),
+            "desired_state": t.get("DesiredState", ""),
+            "message": status.get("Err") or status.get("Message", ""),
+            "exit_code": cstatus.get("ExitCode"),
+            "created": t.get("CreatedAt", ""),
+            "updated": status.get("Timestamp", ""),
+            "exists": cid in existing,
+        })
+
+    return {
+        "stack": stack_name,
+        "service": service_name,
+        "type": "swarm",
+        "details": {
+            "Full name": full_name,
+            "Image": strip_digest(container_spec.get("Image", "")),
+            "Previous image": strip_digest(prev_image),
+            "Mode": "global" if "Global" in mode else "replicated",
+            "Replicas": replicas,
+            "Ports": ", ".join(
+                f"{p.get('PublishedPort')}:{p.get('TargetPort')}/{p.get('Protocol', 'tcp')}"
+                for p in (svc.get("Endpoint", {}).get("Ports") or [])
+            ),
+            "Command": " ".join((container_spec.get("Command") or []) + (container_spec.get("Args") or [])),
+            "Mounts": ", ".join(f"{m.get('Source', '')}:{m.get('Target', '')}" for m in (container_spec.get("Mounts") or [])),
+            "Restart policy": (task_tpl.get("RestartPolicy") or {}).get("Condition", ""),
+            "Update status": (svc.get("UpdateStatus") or {}).get("State", ""),
+            "Created": svc.get("CreatedAt", ""),
+            "Updated": svc.get("UpdatedAt", ""),
+        },
+        "containers": containers,
+    }
+
+
+def get_compose_service_detail(stack: dict, service_name: str):
+    client = docker_client()
+    found = client.containers.list(all=True, filters={"label": [
+        f"com.docker.compose.project={stack['Name']}",
+        f"com.docker.compose.service={service_name}",
+    ]})
+    if not found:
+        raise HTTPException(status_code=404, detail="No containers found for this service")
+    found.sort(key=lambda c: c.attrs.get("Created", ""), reverse=True)
+
+    containers = []
+    for c in found:
+        state = c.attrs.get("State", {})
+        containers.append({
+            "task_id": "",
+            "container_id": c.id,
+            "name": c.name,
+            "image": c.image.tags[0] if c.image.tags else c.attrs.get("Config", {}).get("Image", ""),
+            "state": state.get("Status", c.status),
+            "desired_state": "",
+            "message": state.get("Error", ""),
+            "exit_code": state.get("ExitCode"),
+            "created": c.attrs.get("Created", ""),
+            "updated": state.get("FinishedAt") if state.get("Status") != "running" else state.get("StartedAt", ""),
+            "exists": True,
+        })
+    latest = found[0].attrs
+    config = latest.get("Config", {})
+    return {
+        "stack": stack["Name"],
+        "service": service_name,
+        "type": "compose",
+        "details": {
+            "Image": config.get("Image", ""),
+            "Command": " ".join(config.get("Cmd") or []),
+            "Restart policy": latest.get("HostConfig", {}).get("RestartPolicy", {}).get("Name", ""),
+            "Compose file": stack.get("ConfigFiles", ""),
+        },
+        "containers": containers,
     }
 
 
@@ -482,4 +622,17 @@ def pull_image(name: str = Form(...)):
 
 
 # ── Static SPA (must be last) ─────────────────────────────────────────────────
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+
+class SPAStaticFiles(StaticFiles):
+    """Serve index.html for unknown non-API paths so client-side routes survive a reload."""
+
+    async def get_response(self, path, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as e:
+            if e.status_code == 404 and not path.startswith("api"):
+                return await super().get_response("index.html", scope)
+            raise
+
+
+app.mount("/", SPAStaticFiles(directory="static", html=True), name="static")

@@ -50,6 +50,8 @@ const API = {
   stacks: {
     list: () => API.get('/api/stacks'),
     get: (name) => API.get(`/api/stacks/${encodeURIComponent(name)}`),
+    service: (stackName, serviceName) =>
+      API.get(`/api/stacks/${encodeURIComponent(stackName)}/services/${encodeURIComponent(serviceName)}`),
     uploadCompose: (name, file) => {
       const fd = new FormData();
       fd.append('file', file);

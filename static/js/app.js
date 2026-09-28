@@ -17,6 +17,22 @@ function fmtDate(iso) {
   try { return new Date(iso).toLocaleDateString(); } catch { return iso; }
 }
 
+function fmtDateTime(iso) {
+  if (!iso || iso.startsWith('0001')) return '—';
+  const d = new Date(iso);
+  return isNaN(d) ? iso : d.toLocaleString();
+}
+
+function fmtAgo(iso) {
+  if (!iso || iso.startsWith('0001')) return '';
+  const secs = Math.round((Date.now() - new Date(iso)) / 1000);
+  if (isNaN(secs)) return '';
+  if (secs < 60) return 'just now';
+  const units = [['d', 86400], ['h', 3600], ['m', 60]];
+  for (const [u, n] of units) if (secs >= n) return `${Math.floor(secs / n)}${u} ago`;
+  return '';
+}
+
 function statusColor(state) {
   if (!state) return 'gray';
   const s = state.toLowerCase();
@@ -585,7 +601,8 @@ function serviceRow(stackName, svcName, currentImage, status) {
   const searchText = [svcName, currentImage, label, ports].join(' ').toLowerCase();
 
   return `
-    <div class="service-row" data-search="${escHtml(searchText)}">
+    <div class="service-row service-row-link" data-search="${escHtml(searchText)}"
+      onclick="Router.navigate('/stacks/${encodeURIComponent(stackName)}/services/${encodeURIComponent(svcName)}')">
       <div>
         <div class="service-name">${escHtml(svcName)}</div>
         <div class="status-dot" style="margin-top:3px">
@@ -596,10 +613,148 @@ function serviceRow(stackName, svcName, currentImage, status) {
       </div>
       <div class="service-image" title="${escHtml(currentImage)}">${escHtml(currentImage || '—')}</div>
       <button class="btn btn-ghost btn-sm"
-        onclick="openUpdateImage('${escHtml(stackName)}', '${escHtml(svcName)}', '${escHtml(currentImage)}')">
+        onclick="event.stopPropagation();openUpdateImage('${escHtml(stackName)}', '${escHtml(svcName)}', '${escHtml(currentImage)}')">
         Update Image
       </button>
+      <span class="text-muted" style="font-size:16px">›</span>
     </div>`;
+}
+
+// ── Service Detail Page ───────────────────────────────────────────────────────
+
+async function renderServiceDetail({ name, service }) {
+  setActiveNav('stacks');
+  const stackPath = `/stacks/${encodeURIComponent(name)}`;
+  setTopbar('Service', service, [
+    { label: 'Stacks', href: '/stacks' },
+    { label: name, href: stackPath },
+    { label: service },
+  ]);
+
+  const body = $('#page-body');
+  body.innerHTML = `<div class="loading-state"><div class="spinner"></div>Loading service…</div>`;
+
+  let svc;
+  try { svc = await API.stacks.service(name, service); }
+  catch (e) { body.innerHTML = errorState(e.message); return; }
+
+  const containers = svc.containers || [];
+  const latest = containers.find(c => c.state === 'running') || containers[0];
+  const details = Object.entries(svc.details || {}).filter(([, v]) => v !== '' && v != null);
+  const image = svc.details?.Image || '';
+  const headColor = latest ? statusColor(latest.state) : 'gray';
+
+  body.innerHTML = `
+    <div class="flex items-center gap-2 mb-5">
+      <button class="btn btn-ghost btn-sm" onclick="Router.navigate('${stackPath}')">← Back</button>
+      <div class="flex items-center gap-2" style="margin-left:8px">
+        <span class="dot dot-${headColor}"></span>
+        <span style="font-size:16px;font-weight:700;">${escHtml(service)}</span>
+        ${svc.details?.Replicas ? `<span class="tag tag-default">${escHtml(svc.details.Replicas)}</span>` : ''}
+        ${svc.type === 'swarm' ? '<span class="tag tag-accent">swarm</span>' : ''}
+      </div>
+      <div class="ml-auto flex gap-2">
+        <button class="btn btn-ghost btn-sm" onclick="renderServiceDetail({ name: '${escHtml(name)}', service: '${escHtml(service)}' })">⟳ Refresh</button>
+        <button class="btn btn-primary btn-sm" onclick="openUpdateImage('${escHtml(name)}', '${escHtml(service)}', '${escHtml(image)}')">Update Image</button>
+      </div>
+    </div>
+
+    <div class="card mb-5">
+      <div class="card-header"><h3>Details</h3></div>
+      <div class="kv-grid">
+        ${details.map(([k, v]) => `
+          <div class="kv-key">${escHtml(k)}</div>
+          <div class="kv-val mono">${escHtml(['Created', 'Updated'].includes(k) ? `${fmtDateTime(v)}  (${fmtAgo(v)})` : v)}</div>
+        `).join('')}
+      </div>
+    </div>
+
+    <div class="card mb-5">
+      <div class="card-header">
+        <h3>Latest Container</h3>
+        ${latest ? `
+          <span class="status-dot" style="margin-left:6px">
+            <span class="dot dot-${statusColor(latest.state)}"></span>
+            <span class="text-muted" style="font-size:12px">${escHtml(latest.state)} · started ${escHtml(fmtAgo(latest.created) || '—')}</span>
+          </span>
+          <span class="ml-auto mono text-muted" style="font-size:11px">${escHtml(latest.container_id.slice(0, 12) || 'no container')}</span>` : ''}
+      </div>
+      <div style="padding:14px 18px">
+        ${!latest ? `<p class="text-muted">This service has no containers.</p>`
+          : !latest.exists ? `<p class="text-muted">The latest container is not on this node anymore${latest.message ? ` — ${escHtml(latest.message)}` : ''}.</p>`
+          : `
+          <div class="flex items-center gap-2 mb-3">
+            <span class="mono text-muted" style="font-size:12px;flex:1" title="${escHtml(latest.image)}">${escHtml(latest.image)}</span>
+            <select class="form-select" id="svc-log-tail" style="width:auto;padding:5px 8px"
+              onchange="loadServiceLogs('${escHtml(latest.container_id)}')">
+              <option value="100">Last 100 lines</option>
+              <option value="300" selected>Last 300 lines</option>
+              <option value="1000">Last 1000 lines</option>
+              <option value="5000">Last 5000 lines</option>
+            </select>
+            <button class="btn btn-ghost btn-sm" onclick="loadServiceLogs('${escHtml(latest.container_id)}')">⟳ Refresh logs</button>
+          </div>
+          <div class="pull-output" id="svc-log-view" style="max-height:460px">Loading logs…</div>`}
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <div class="table-toolbar">
+        <span class="table-toolbar-title">Container History <span class="tag tag-default" style="margin-left:6px">${containers.length}</span></span>
+      </div>
+      <table>
+        <thead>
+          <tr><th>State</th><th>Container</th><th>Image</th><th>Created</th><th>Exit / Message</th><th></th></tr>
+        </thead>
+        <tbody>
+          ${containers.length ? containers.map(c => historyRow(c, c === latest)).join('')
+            : `<tr><td colspan="6" class="text-muted" style="text-align:center;padding:24px">No containers.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+
+  if (latest?.exists) loadServiceLogs(latest.container_id);
+}
+
+function historyRow(c, isLatest) {
+  const color = statusColor(c.state);
+  const shortId = c.container_id.slice(0, 12);
+  const exit = c.exit_code != null && c.state !== 'running' ? `exit ${c.exit_code}` : '';
+  const msg = [exit, c.message && c.message !== c.state ? c.message : ''].filter(Boolean).join(' · ');
+  return `
+    <tr${isLatest ? ' class="row-highlight"' : ''}>
+      <td>
+        <span class="status-dot">
+          <span class="dot dot-${color}"></span>
+          <span class="text-${color === 'gray' ? 'muted' : color}">${escHtml(c.state || 'unknown')}</span>
+        </span>
+        ${isLatest ? '<span class="tag tag-accent" style="margin-left:6px;font-size:10px">latest</span>' : ''}
+      </td>
+      <td><span class="mono">${escHtml(shortId || '—')}</span>${c.task_id ? `<br><span class="text-muted mono" style="font-size:10px">task ${escHtml(c.task_id)}</span>` : ''}</td>
+      <td><span class="mono text-muted" title="${escHtml(c.image)}">${escHtml(c.image)}</span></td>
+      <td title="${escHtml(fmtDateTime(c.created))}">${escHtml(fmtAgo(c.created) || fmtDateTime(c.created))}</td>
+      <td><span class="text-muted" style="font-size:12px" title="${escHtml(msg)}">${escHtml(msg || '—')}</span></td>
+      <td style="text-align:right">
+        ${c.exists
+          ? `<button class="btn btn-ghost btn-sm" onclick="openContainerLogs('${escHtml(c.container_id)}', '${escHtml(c.name + ' · ' + shortId)}')">Logs</button>`
+          : `<span class="text-muted" style="font-size:11px" title="Container was removed from this node">removed</span>`}
+      </td>
+    </tr>`;
+}
+
+async function loadServiceLogs(containerId) {
+  const view = $('#svc-log-view');
+  if (!view) return;
+  const tail = $('#svc-log-tail')?.value || 300;
+  view.textContent = 'Loading logs…';
+  try {
+    const res = await API.containers.logs(containerId, tail);
+    view.textContent = res.logs || '(no output)';
+    view.scrollTop = view.scrollHeight;
+  } catch (e) {
+    view.textContent = `Failed to load logs: ${e.message}`;
+  }
 }
 
 // ── Modals ────────────────────────────────────────────────────────────────────
@@ -727,8 +882,8 @@ async function deployImageUpdate(stackName, serviceName) {
     Toast.success(`Deployed ${serviceName} → ${image}`);
     // Show download option (swarm stacks have no compose file to download)
     if (res.type !== 'swarm') setTimeout(() => showPostDeployBanner(stackName), 300);
-    // Refresh page
-    setTimeout(() => renderStackDetail({ name: stackName }), 800);
+    // Refresh whichever page we're on (stack or service detail)
+    setTimeout(() => Router._dispatch(location.pathname), 800);
   } catch (e) {
     Toast.error(e.message);
     if (btn) { btn.disabled = false; btn.textContent = 'Deploy'; }
@@ -1204,6 +1359,7 @@ document.addEventListener('DOMContentLoaded', () => {
   Router.on('/containers',   () => renderContainers());
   Router.on('/stacks',       () => renderStacks());
   Router.on('/stacks/:name', (p) => renderStackDetail(p));
+  Router.on('/stacks/:name/services/:service', (p) => renderServiceDetail(p));
 
   Router.start();
 });
