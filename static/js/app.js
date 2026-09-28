@@ -1409,14 +1409,17 @@ function openPullImageModal() {
     </div>
     <div class="modal-body" id="pull-modal-body">
       <div class="form-group">
-        <label class="form-label">Image names — one per line</label>
-        <textarea class="form-input" id="pull-image-name" rows="5" spellcheck="false"
+        <label class="form-label">Images or <code>docker pull</code> commands — one per line</label>
+        <textarea class="form-input" id="pull-image-name" rows="6" spellcheck="false"
           style="resize:vertical;font-family:'SF Mono','Fira Code',monospace"
-          placeholder="nginx:latest&#10;ubuntu:22.04&#10;ghcr.io/user/repo:tag"
+          placeholder="nginx:latest&#10;docker pull ubuntu:22.04&#10;docker pull --platform linux/amd64 ghcr.io/user/repo:tag"
+          oninput="$('#pull-parse-errors').style.display='none'"
           onkeydown="if(event.key==='Enter' && (event.metaKey||event.ctrlKey)) doPullImage()"></textarea>
       </div>
+      <div id="pull-parse-errors" class="pull-output" style="display:none;color:#f87171;margin-bottom:10px"></div>
       <div style="font-size:11.5px;color:var(--text-muted);margin-top:-6px">
         Press ⌘/Ctrl+Enter or click Pull — tag defaults to <code>latest</code> if omitted.
+        <code>--platform</code> is honoured; blank lines and <code>#</code> comments are skipped.
       </div>
     </div>
     <div class="modal-footer">
@@ -1429,16 +1432,81 @@ function openPullImageModal() {
   setTimeout(() => $('#pull-image-name')?.focus(), 80);
 }
 
-function parseImageNames(text) {
-  const names = (text || '').split(/\s+/).map(n => n.trim()).filter(Boolean);
-  return [...new Set(names)];
+// Each line is either bare image refs (`nginx:latest`, space-separated is fine) or a
+// pasted pull command (`docker pull [--platform p] img`, `docker image pull …`),
+// optionally with `sudo`, a `$ ` prompt, or several commands joined by && / ;
+const IMAGE_REF_RE = /^[a-z0-9][a-z0-9._\-\/:@]*$/i;
+const PULL_FLAGS_IGNORED = ['-q', '--quiet', '--disable-content-trust'];
+
+function parsePullLines(text) {
+  const pulls = [];
+  const errors = [];
+  const add = (image, platform, line) => {
+    image = image.replace(/^['"]|['"]$/g, '');
+    if (!IMAGE_REF_RE.test(image)) errors.push(`"${line}" — "${image}" doesn't look like an image`);
+    else pulls.push({ image, platform });
+  };
+
+  (text || '').split('\n').forEach(raw => {
+    const line = raw.replace(/\s+#.*$/, '').trim();
+    if (!line || line.startsWith('#')) return;
+
+    line.split(/&&|;/).map(c => c.trim()).filter(Boolean).forEach(cmd => {
+      let tokens = cmd.replace(/^\$\s*/, '').split(/\s+/);
+      if (tokens[0] === 'sudo') tokens = tokens.slice(1);
+
+      if (tokens[0] !== 'docker') {
+        // Bare image refs
+        tokens.forEach(t => t.startsWith('-')
+          ? errors.push(`"${line}" — flag "${t}" needs a docker pull command`)
+          : add(t, '', line));
+        return;
+      }
+
+      const sub = tokens[1] === 'image' ? tokens.slice(2) : tokens.slice(1);
+      if (sub[0] !== 'pull') { errors.push(`"${line}" — only docker pull commands are supported`); return; }
+
+      let platform = '';
+      const images = [];
+      for (let i = 1; i < sub.length; i++) {
+        const t = sub[i];
+        if (t === '--platform') platform = sub[++i] || '';
+        else if (t.startsWith('--platform=')) platform = t.slice('--platform='.length);
+        else if (t === '-a' || t === '--all-tags') { errors.push(`"${line}" — --all-tags isn't supported, list the tags you want`); return; }
+        else if (PULL_FLAGS_IGNORED.some(f => t === f || t.startsWith(f + '='))) continue;
+        else if (t.startsWith('-')) { errors.push(`"${line}" — unsupported flag "${t}"`); return; }
+        else images.push(t);
+      }
+      if (images.length !== 1) { errors.push(`"${line}" — expected one image after docker pull`); return; }
+      add(images[0], platform, line);
+    });
+  });
+
+  // De-duplicate identical image + platform pairs, keeping order
+  const seen = new Set();
+  const unique = pulls.filter(p => {
+    const k = `${p.image}|${p.platform}`;
+    return seen.has(k) ? false : seen.add(k);
+  });
+  return { pulls: unique, errors };
+}
+
+function pullLabel(p) {
+  return p.platform ? `${p.image} (${p.platform})` : p.image;
 }
 
 async function doPullImage() {
-  const names = parseImageNames($('#pull-image-name')?.value);
-  if (!names.length) { Toast.error('Enter an image name first.'); return; }
-  if (names.length > 1) return doPullImages(names);
-  const name = names[0];
+  const { pulls, errors } = parsePullLines($('#pull-image-name')?.value);
+  if (errors.length) {
+    const box = $('#pull-parse-errors');
+    box.textContent = `Fix ${errors.length === 1 ? 'this line' : 'these lines'} first:\n` + errors.join('\n');
+    box.style.display = '';
+    return;
+  }
+  if (!pulls.length) { Toast.error('Enter an image name first.'); return; }
+  if (pulls.length > 1) return doPullImages(pulls);
+  const pull = pulls[0];
+  const name = pullLabel(pull);
 
   const btn = $('#pull-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spinner" style="width:14px;height:14px"></div> Pulling…'; }
@@ -1453,7 +1521,7 @@ async function doPullImage() {
   `;
 
   try {
-    const res = await API.images.pull(name);
+    const res = await API.images.pull(pull.image, pull.platform);
     const footer = document.querySelector('#modal-overlay .modal-footer');
     const modalBody = $('#pull-modal-body');
     if (modalBody) modalBody.innerHTML = `
@@ -1483,7 +1551,8 @@ async function doPullImage() {
   }
 }
 
-async function doPullImages(names) {
+async function doPullImages(pulls) {
+  const names = pulls.map(pullLabel);
   const body = $('#pull-modal-body');
   const footer = document.querySelector('#modal-overlay .modal-footer');
   body.innerHTML = `
@@ -1505,7 +1574,7 @@ async function doPullImages(names) {
     const status = $(`#pull-status-${i}`);
     if (status) status.textContent = 'pulling…';
     try {
-      await API.images.pull(names[i]);
+      await API.images.pull(pulls[i].image, pulls[i].platform);
       if (icon) icon.textContent = '✅';
       if (status) { status.textContent = 'done'; status.style.color = 'var(--green)'; }
     } catch (e) {

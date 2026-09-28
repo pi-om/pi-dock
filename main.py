@@ -777,14 +777,19 @@ async def load_image_tar(file: UploadFile = File(...)):
 
 
 @app.post("/api/images/pull")
-def pull_image(name: str = Form(...)):
+def pull_image(name: str = Form(...), platform: str = Form("")):
     name = name.strip()
+    platform = platform.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Image name is required")
-    proc = subprocess.run(
-        ["docker", "pull", name],
-        capture_output=True, text=True, timeout=600,
-    )
+    # Refuse anything docker would read as a flag rather than an image/platform
+    if name.startswith("-") or not re.fullmatch(r"[A-Za-z0-9][\w.\-/:@]*", name):
+        raise HTTPException(status_code=400, detail=f"Not a valid image reference: {name}")
+    if platform and not re.fullmatch(r"[a-z0-9_]+/[a-z0-9_]+(/[a-z0-9_]+)?", platform):
+        raise HTTPException(status_code=400, detail=f"Not a valid platform: {platform}")
+
+    cmd = ["docker", "pull"] + (["--platform", platform] if platform else []) + [name]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if proc.returncode != 0:
         raise HTTPException(status_code=500, detail=proc.stderr or "docker pull failed")
     return {"success": True, "output": proc.stdout.strip()}

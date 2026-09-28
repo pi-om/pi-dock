@@ -33,9 +33,10 @@ const API = {
       fd.append('file', file);
       return API.post('/api/images/load', fd, true);
     },
-    pull: (name) => {
+    pull: (name, platform = '') => {
       const fd = new FormData();
       fd.append('name', name);
+      if (platform) fd.append('platform', platform);
       return API.post('/api/images/pull', fd, true);
     },
   },
