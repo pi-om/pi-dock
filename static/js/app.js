@@ -185,7 +185,7 @@ async function renderDashboard() {
 
     <div class="section-block">
       <div class="section-header">
-        <span class="section-title">Active Stacks</span>
+        <span class="section-title">Active Stacks <span class="tag tag-default" style="margin-left:4px">${stacks.length}</span></span>
         <button class="btn btn-primary btn-sm" onclick="Router.navigate('/stacks')">
           View all stacks
         </button>
@@ -199,7 +199,7 @@ async function renderDashboard() {
         </div>
       </div>` : `
       <div class="stack-grid">
-        ${stacks.slice(0, 6).map(s => stackCard(s)).join('')}
+        ${stacks.map(s => stackCard(s)).join('')}
       </div>`}
     </div>
   `;
