@@ -541,11 +541,13 @@ async function renderStackDetail({ name }) {
     <div class="card mb-5">
       <div class="card-header">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
-        <h3>Services <span class="tag tag-default" style="margin-left:4px">${allServices.length}</span></h3>
+        <h3>Services <span class="tag tag-default" style="margin-left:4px" id="svc-count">${allServices.length}</span></h3>
+        ${allServices.length ? `<input class="search-input ml-auto" id="svc-search" placeholder="Search services, images…" />` : ''}
       </div>
       ${allServices.length === 0
         ? `<div class="empty-state" style="padding:28px"><p>No services found.</p></div>`
-        : allServices.map(sn => serviceRow(name, sn, serviceImages[sn] || '', svcStatus[sn])).join('')
+        : `<div id="svc-list">${allServices.map(sn => serviceRow(name, sn, serviceImages[sn] || '', svcStatus[sn])).join('')}</div>
+           <div class="empty-state" id="svc-no-match" style="padding:28px;display:none"><p>No services match your search.</p></div>`
       }
     </div>
 
@@ -558,6 +560,18 @@ async function renderStackDetail({ name }) {
       </div>
     </div>` : ''}
   `;
+
+  $('#svc-search')?.addEventListener('input', (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    let shown = 0;
+    $$('#svc-list .service-row').forEach(row => {
+      const match = row.dataset.search.includes(q);
+      row.style.display = match ? '' : 'none';
+      if (match) shown++;
+    });
+    $('#svc-count').textContent = q ? `${shown} / ${allServices.length}` : allServices.length;
+    $('#svc-no-match').style.display = shown ? 'none' : '';
+  });
 }
 
 function serviceRow(stackName, svcName, currentImage, status) {
@@ -568,8 +582,10 @@ function serviceRow(stackName, svcName, currentImage, status) {
     : 'not deployed';
   const ports = status?.Publishers?.map(p => `${p.PublishedPort || ''}:${p.TargetPort}`).filter(Boolean).join(', ') || '';
 
+  const searchText = [svcName, currentImage, label, ports].join(' ').toLowerCase();
+
   return `
-    <div class="service-row">
+    <div class="service-row" data-search="${escHtml(searchText)}">
       <div>
         <div class="service-name">${escHtml(svcName)}</div>
         <div class="status-dot" style="margin-top:3px">
