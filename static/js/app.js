@@ -1014,10 +1014,10 @@ function showPostDeployBanner(stackName) {
 
 // ── Deploy new compose (upload or pick a file on the server) ──────────────────
 
-const deployState = { stack: '', type: '', preview: null, browsePath: '' };
+const deployState = { stack: '', type: '', preview: null, browsePath: '', prune: false };
 
 function openDeployCompose(stackName, stackType) {
-  Object.assign(deployState, { stack: stackName, type: stackType, preview: null });
+  Object.assign(deployState, { stack: stackName, type: stackType, preview: null, prune: false });
   let lastDir = '';
   try { lastDir = localStorage.getItem(`deploy-dir:${stackName}`) || ''; } catch {}
 
@@ -1123,27 +1123,40 @@ function openFsEntry(i) {
 async function previewDeploy(source) {
   const body = $('#deploy-body');
   const footer = $('#deploy-footer');
-  const backToPicker = () => openDeployCompose(deployState.stack, deployState.type);
   body.innerHTML = `<div class="loading-state"><div class="spinner"></div>Checking compose file against ${escHtml(deployState.stack)}…</div>`;
   footer.innerHTML = '';
 
-  let p;
-  try { p = await API.stacks.previewDeploy(deployState.stack, source); }
+  try { deployState.preview = await API.stacks.previewDeploy(deployState.stack, source); }
   catch (e) {
     body.innerHTML = `
       <div style="color:var(--red);font-weight:600;margin-bottom:8px">✕ Can't use this file</div>
       <div class="pull-output" style="color:#f87171;max-height:300px">${escHtml(e.message)}</div>`;
     footer.innerHTML = `<button class="btn btn-ghost" id="deploy-back">← Pick another file</button>`;
-    $('#deploy-back').onclick = backToPicker;
+    $('#deploy-back').onclick = () => openDeployCompose(deployState.stack, deployState.type);
     return;
   }
-  deployState.preview = p;
+  renderDeployPreview();
+}
 
-  const changed = p.services.filter(s => s.change === 'changed');
-  const added = p.services.filter(s => s.change === 'added');
-  const unchanged = p.services.filter(s => s.change === 'unchanged');
+function deploySummary(p) {
+  const count = (c) => p.services.filter(s => s.change === c).length;
+  return {
+    changed: count('changed'),
+    added: count('added'),
+    unchanged: count('unchanged'),
+    missing: p.images.filter(i => !i.present),
+    newImages: p.images.filter(i => i.new_to_stack),
+  };
+}
+
+function renderDeployPreview() {
+  const p = deployState.preview;
+  const body = $('#deploy-body');
+  const footer = $('#deploy-footer');
+  const sum = deploySummary(p);
   const isSwarm = p.type === 'swarm';
   const pruneFlag = isSwarm ? '--prune' : '--remove-orphans';
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
   const svcRow = (s) => `
     <div class="deploy-svc">
@@ -1155,6 +1168,20 @@ async function previewDeploy(source) {
       </span>
     </div>`;
 
+  // Not-pulled first, then images new to the stack, then the rest
+  const images = [...p.images].sort((a, b) =>
+    (a.present - b.present) || (b.new_to_stack - a.new_to_stack) || a.image.localeCompare(b.image));
+  const imageRow = (i) => `
+    <div class="deploy-img">
+      <span title="${i.present ? 'Already on this host' : 'Not on this host yet'}">${i.present ? '✅' : '⬇️'}</span>
+      <span class="mono deploy-svc-img">${escHtml(i.image)}</span>
+      <span>
+        ${i.new_to_stack ? '<span class="tag tag-accent" style="font-size:10px">new to stack</span>' : ''}
+        ${i.present ? '' : '<span class="tag tag-orange" style="font-size:10px">not pulled</span>'}
+      </span>
+      <span class="text-muted" style="font-size:11px" title="${escHtml(i.services.join(', '))}">${escHtml(i.services.length > 2 ? `${i.services.slice(0, 2).join(', ')} +${i.services.length - 2}` : i.services.join(', '))}</span>
+    </div>`;
+
   body.innerHTML = `
     <div class="mb-3" style="font-size:12px">
       <span class="text-muted">${p.source === 'upload' ? 'Uploaded, saved on the server as' : 'Server file'}</span>
@@ -1162,27 +1189,41 @@ async function previewDeploy(source) {
     </div>
 
     <div class="flex gap-2 mb-3" style="flex-wrap:wrap">
-      <span class="tag ${changed.length ? 'tag-orange' : 'tag-default'}">${changed.length} image change${changed.length === 1 ? '' : 's'}</span>
-      <span class="tag ${added.length ? 'tag-green' : 'tag-default'}">${added.length} new service${added.length === 1 ? '' : 's'}</span>
+      <span class="tag ${sum.changed ? 'tag-orange' : 'tag-default'}">${plural(sum.changed, 'image change')}</span>
+      <span class="tag ${sum.added ? 'tag-green' : 'tag-default'}">${plural(sum.added, 'new service')}</span>
+      <span class="tag ${sum.newImages.length ? 'tag-accent' : 'tag-default'}">${plural(sum.newImages.length, 'new image')}</span>
+      <span class="tag ${sum.missing.length ? 'tag-red' : 'tag-green'}">${sum.missing.length ? `${sum.missing.length} not pulled` : 'all images pulled'}</span>
       <span class="tag ${p.not_in_file.length ? 'tag-red' : 'tag-default'}">${p.not_in_file.length} running but not in file</span>
-      <span class="tag tag-default">${unchanged.length} unchanged</span>
+      <span class="tag tag-default">${sum.unchanged} unchanged</span>
     </div>
 
-    ${changed.length ? `<div class="deploy-group"><div class="deploy-group-title">Image changes</div>${changed.map(svcRow).join('')}</div>` : ''}
-    ${added.length ? `<div class="deploy-group"><div class="deploy-group-title">New services</div>${added.map(svcRow).join('')}</div>` : ''}
+    ${sum.missing.length ? `
+      <div class="deploy-notice">
+        <strong>${plural(sum.missing.length, 'image')} ${sum.missing.length === 1 ? "isn't" : "aren't"} pulled on this host yet.</strong>
+        Pull ${sum.missing.length === 1 ? 'it' : 'them'} first to catch registry or auth errors before anything changes —
+        otherwise docker pulls during the deploy and a failed pull leaves services half-updated.
+      </div>` : ''}
+
+    <div class="deploy-group">
+      <div class="deploy-group-title">Images in this file (${p.images.length})</div>
+      ${images.length ? images.map(imageRow).join('') : '<div class="deploy-svc text-muted">No images — every service builds locally.</div>'}
+    </div>
+
+    ${sum.changed ? `<div class="deploy-group"><div class="deploy-group-title">Image changes</div>${p.services.filter(s => s.change === 'changed').map(svcRow).join('')}</div>` : ''}
+    ${sum.added ? `<div class="deploy-group"><div class="deploy-group-title">New services</div>${p.services.filter(s => s.change === 'added').map(svcRow).join('')}</div>` : ''}
     ${p.not_in_file.length ? `
       <div class="deploy-group">
         <div class="deploy-group-title">Running but not in this file</div>
         <div style="padding:8px 12px;font-size:12px" class="mono">${p.not_in_file.map(escHtml).join(', ')}</div>
         <label class="flex items-center gap-2" style="padding:0 12px 10px;font-size:12px;cursor:pointer">
-          <input type="checkbox" id="deploy-prune" />
+          <input type="checkbox" id="deploy-prune" ${deployState.prune ? 'checked' : ''} onchange="deployState.prune = this.checked" />
           <span>Remove these services (<code>${pruneFlag}</code>) — otherwise they keep running untouched</span>
         </label>
       </div>` : ''}
-    ${unchanged.length ? `
+    ${sum.unchanged ? `
       <details class="deploy-group">
-        <summary class="deploy-group-title" style="cursor:pointer">Unchanged (${unchanged.length})</summary>
-        ${unchanged.map(svcRow).join('')}
+        <summary class="deploy-group-title" style="cursor:pointer">Unchanged (${sum.unchanged})</summary>
+        ${p.services.filter(s => s.change === 'unchanged').map(svcRow).join('')}
       </details>` : ''}
     ${p.warnings ? `
       <details class="deploy-group" open>
@@ -1196,17 +1237,112 @@ async function previewDeploy(source) {
   `;
 
   footer.innerHTML = `
-    <button class="btn btn-ghost" id="deploy-back">← Pick another file</button>
-    <button class="btn btn-primary" id="deploy-go">⇪ Deploy to ${escHtml(deployState.stack)}</button>
+    <button class="btn btn-ghost" id="deploy-back" style="margin-right:auto">← Pick another file</button>
+    ${sum.missing.length ? `
+      <button class="btn btn-ghost" id="deploy-nopull" title="Let docker pull during the deploy">Deploy without pulling</button>
+      <button class="btn btn-ghost" id="deploy-pullonly">↓ Pull ${sum.missing.length} only</button>
+      <button class="btn btn-primary" id="deploy-go">↓ Pull ${sum.missing.length} &amp; Deploy</button>`
+    : `<button class="btn btn-primary" id="deploy-go">⇪ Deploy to ${escHtml(p.stack)}</button>`}
   `;
-  $('#deploy-back').onclick = backToPicker;
-  $('#deploy-go').onclick = runDeploy;
+  $('#deploy-back').onclick = () => openDeployCompose(deployState.stack, deployState.type);
+  $('#deploy-go').onclick = () => confirmDeploy(sum.missing.length > 0);
+  if (sum.missing.length) {
+    $('#deploy-nopull').onclick = () => confirmDeploy(false);
+    $('#deploy-pullonly').onclick = () => pullMissingImages(false);
+  }
+}
+
+function confirmDeploy(withPull) {
+  const p = deployState.preview;
+  const sum = deploySummary(p);
+  const prune = !!deployState.prune;
+  const steps = [
+    withPull && `Pull <strong>${sum.missing.length}</strong> image${sum.missing.length === 1 ? '' : 's'} that ${sum.missing.length === 1 ? "isn't" : "aren't"} on this host`,
+    sum.changed && `Update the image of <strong>${sum.changed}</strong> service${sum.changed === 1 ? '' : 's'}`,
+    sum.added && `Create <strong>${sum.added}</strong> new service${sum.added === 1 ? '' : 's'}`,
+    p.not_in_file.length && (prune
+      ? `<span style="color:var(--red)">Remove <strong>${p.not_in_file.length}</strong> running service${p.not_in_file.length === 1 ? '' : 's'} not in the file</span>`
+      : `Leave <strong>${p.not_in_file.length}</strong> service${p.not_in_file.length === 1 ? '' : 's'} not in the file running`),
+    `Apply the rest of the file to <strong>${sum.unchanged}</strong> unchanged service${sum.unchanged === 1 ? '' : 's'} (only those whose config differs restart)`,
+  ].filter(Boolean);
+
+  const footer = $('#deploy-footer');
+  footer.innerHTML = `
+    <div class="deploy-confirm">
+      <div style="font-weight:600;margin-bottom:6px">Deploy to <span class="mono">${escHtml(p.stack)}</span>? This will:</div>
+      <ul>${steps.map(s => `<li>${s}</li>`).join('')}</ul>
+    </div>
+    <button class="btn btn-ghost" id="deploy-cancel">Cancel</button>
+    <button class="btn ${prune && p.not_in_file.length ? 'btn-danger' : 'btn-primary'}" id="deploy-confirm">
+      Yes, ${withPull ? 'pull &amp; deploy' : 'deploy'}
+    </button>
+  `;
+  $('#deploy-cancel').onclick = renderDeployPreview;
+  $('#deploy-confirm').onclick = () => withPull ? pullMissingImages(true) : runDeploy();
+}
+
+async function pullMissingImages(thenDeploy) {
+  const p = deployState.preview;
+  const missing = p.images.filter(i => !i.present);
+  const body = $('#deploy-body');
+  const footer = $('#deploy-footer');
+  body.innerHTML = `
+    <div style="margin-bottom:12px;font-size:13px;font-weight:600">
+      Pulling ${missing.length} image${missing.length === 1 ? '' : 's'}${thenDeploy ? ` — then deploying ${escHtml(p.stack)}` : ''}…
+    </div>
+    <div class="tar-file-list">
+      ${missing.map((m, i) => `
+        <div class="tar-file-item">
+          <span id="dpull-icon-${i}" style="font-size:16px">⏳</span>
+          <span class="tar-file-name mono">${escHtml(m.image)}</span>
+          <span class="tar-file-size" id="dpull-status-${i}">waiting…</span>
+        </div>`).join('')}
+    </div>
+    <div id="dpull-errors"></div>
+  `;
+  footer.innerHTML = '';
+
+  const errors = [];
+  for (let i = 0; i < missing.length; i++) {
+    const icon = $(`#dpull-icon-${i}`);
+    const status = $(`#dpull-status-${i}`);
+    status.textContent = 'pulling…';
+    try {
+      await API.images.pull(missing[i].image);
+      icon.textContent = '✅';
+      status.textContent = 'pulled';
+      status.style.color = 'var(--green)';
+    } catch (e) {
+      errors.push(`${missing[i].image}\n  ${e.message.trim()}`);
+      icon.textContent = '❌';
+      status.textContent = 'failed';
+      status.title = e.message;
+      status.style.color = 'var(--red)';
+    }
+  }
+
+  if (!errors.length) {
+    Toast.success(`Pulled ${missing.length} image${missing.length === 1 ? '' : 's'}`);
+    if (thenDeploy) return runDeploy();
+    return previewDeploy({ path: p.path });   // re-check: everything should now show as pulled
+  }
+
+  $('#dpull-errors').innerHTML = `
+    <div style="color:var(--red);font-weight:600;margin:14px 0 8px">✕ ${errors.length} pull${errors.length === 1 ? '' : 's'} failed — nothing has been deployed</div>
+    <div class="pull-output" style="color:#f87171;max-height:240px">${escHtml(errors.join('\n\n'))}</div>`;
+  footer.innerHTML = `
+    <button class="btn btn-ghost" id="dpull-back" style="margin-right:auto">← Back to preview</button>
+    ${thenDeploy ? '<button class="btn btn-ghost" id="dpull-anyway" title="Docker will try to pull them again during the deploy">Deploy anyway</button>' : ''}
+  `;
+  $('#dpull-back').onclick = () => previewDeploy({ path: p.path });
+  if (thenDeploy) $('#dpull-anyway').onclick = runDeploy;
+  Toast.error('Some images failed to pull');
 }
 
 async function runDeploy() {
   const p = deployState.preview;
   if (!p) return;
-  const prune = !!$('#deploy-prune')?.checked;
+  const prune = !!deployState.prune;
   const body = $('#deploy-body');
   const footer = $('#deploy-footer');
   body.innerHTML = `<div class="loading-state"><div class="spinner"></div>Deploying ${escHtml(p.stack)}… this can take a few minutes.</div>`;

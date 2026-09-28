@@ -703,12 +703,38 @@ async def preview_stack_deploy(
     order = {"changed": 0, "added": 1, "unchanged": 2}
     services.sort(key=lambda s: (order[s["change"]], s["name"]))
 
+    # Every image the file references, whether the stack already runs it, and
+    # whether it's already on this host (docker would otherwise pull at deploy time)
+    client = docker_client()
+    current_images = {strip_digest(i) for i in current.values()}
+    by_image: dict[str, list[str]] = {}
+    for name, cfg in new_services.items():
+        image = (cfg or {}).get("image", "")
+        if image:
+            by_image.setdefault(image, []).append(name)
+    images = []
+    for image, svc_names in sorted(by_image.items()):
+        try:
+            client.api.inspect_image(image)
+            present = True
+        except docker.errors.ImageNotFound:
+            present = False
+        except docker.errors.APIError:
+            present = False
+        images.append({
+            "image": image,
+            "services": sorted(svc_names),
+            "new_to_stack": strip_digest(image) not in current_images,
+            "present": present,
+        })
+
     text = compose_path.read_text(errors="replace")
     return {
         "stack": stack_name,
         "type": stack.get("Type"),
         "path": str(compose_path),
         "source": source,
+        "images": images,
         "services": services,
         "not_in_file": sorted(set(current) - set(new_services)),
         "warnings": warnings,

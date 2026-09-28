@@ -590,6 +590,33 @@ tbody td {
 }
 .deploy-svc-name { font-weight: 600; word-break: break-all; }
 .deploy-svc-img { word-break: break-all; }
+.deploy-img {
+  display: grid;
+  grid-template-columns: 22px 1fr auto minmax(90px, 22%);
+  gap: 10px;
+  align-items: center;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+.deploy-notice {
+  background: var(--orange-bg);
+  border: 1px solid rgba(217,119,6,0.25);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin-bottom: 10px;
+}
+.deploy-confirm {
+  margin-right: auto;
+  font-size: 12.5px;
+  line-height: 1.5;
+  max-width: 560px;
+}
+.deploy-confirm ul { margin: 0; padding-left: 18px; }
+#deploy-footer { align-items: flex-end; flex-wrap: wrap; }
 
 /* ── Env viewer ──────────────────────────────────────────────────────────── */
 .modal:has(.env-view) { width: 820px; }
