@@ -630,6 +630,7 @@ async function renderStackDetail({ name }) {
 
   const color = statusColor(stack.status);
   const isSwarm = stack.type === 'swarm';
+  const runningCount = allServices.filter(sn => isServiceRunning(svcStatus[sn])).length;
 
   body.innerHTML = `
     <div class="flex items-center gap-2 mb-5">
@@ -658,12 +659,18 @@ async function renderStackDetail({ name }) {
       <div class="card-header">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
         <h3>Services <span class="tag tag-default" style="margin-left:4px" id="svc-count">${allServices.length}</span></h3>
-        ${allServices.length ? `<input class="search-input ml-auto" id="svc-search" placeholder="Search services, images…" />` : ''}
+        ${allServices.length ? `
+          <div class="seg-control ml-auto" id="svc-filter">
+            <button data-filter="all">All <span class="seg-count">${allServices.length}</span></button>
+            <button data-filter="running">Running <span class="seg-count">${runningCount}</span></button>
+            <button data-filter="down">Not running <span class="seg-count">${allServices.length - runningCount}</span></button>
+          </div>
+          <input class="search-input" id="svc-search" placeholder="Search services, images…" />` : ''}
       </div>
       ${allServices.length === 0
         ? `<div class="empty-state" style="padding:28px"><p>No services found.</p></div>`
         : `<div id="svc-list">${allServices.map(sn => serviceRow(name, sn, serviceImages[sn] || '', svcStatus[sn])).join('')}</div>
-           <div class="empty-state" id="svc-no-match" style="padding:28px;display:none"><p>No services match your search.</p></div>`
+           <div class="empty-state" id="svc-no-match" style="padding:28px;display:none"><p>No services match.</p></div>`
       }
     </div>
 
@@ -677,17 +684,41 @@ async function renderStackDetail({ name }) {
     </div>` : ''}
   `;
 
-  $('#svc-search')?.addEventListener('input', (e) => {
-    const q = e.target.value.trim().toLowerCase();
+  if (!allServices.length) return;
+
+  let filter = 'all';
+  try { filter = localStorage.getItem('svc-filter') || 'all'; } catch {}
+
+  const applyServiceFilters = () => {
+    const q = $('#svc-search').value.trim().toLowerCase();
     let shown = 0;
     $$('#svc-list .service-row').forEach(row => {
-      const match = row.dataset.search.includes(q);
+      const running = row.dataset.running === '1';
+      const match = row.dataset.search.includes(q)
+        && (filter === 'all' || (filter === 'running') === running);
       row.style.display = match ? '' : 'none';
       if (match) shown++;
     });
-    $('#svc-count').textContent = q ? `${shown} / ${allServices.length}` : allServices.length;
+    $$('#svc-filter button').forEach(b => b.classList.toggle('active', b.dataset.filter === filter));
+    const filtered = q || filter !== 'all';
+    $('#svc-count').textContent = filtered ? `${shown} / ${allServices.length}` : allServices.length;
     $('#svc-no-match').style.display = shown ? 'none' : '';
-  });
+  };
+
+  $$('#svc-filter button').forEach(b => b.addEventListener('click', () => {
+    filter = b.dataset.filter;
+    try { localStorage.setItem('svc-filter', filter); } catch {}
+    applyServiceFilters();
+  }));
+  $('#svc-search').addEventListener('input', applyServiceFilters);
+  applyServiceFilters();
+}
+
+// Fully up: every desired replica running (swarm) or the container running (compose)
+function isServiceRunning(status) {
+  if (!status) return false;
+  if (status.Replicas !== undefined) return status.Desired > 0 && status.Running >= status.Desired;
+  return statusColor(status.State || status.Status || '') === 'green';
 }
 
 function serviceRow(stackName, svcName, currentImage, status) {
@@ -701,7 +732,7 @@ function serviceRow(stackName, svcName, currentImage, status) {
   const searchText = [svcName, currentImage, label, ports].join(' ').toLowerCase();
 
   return `
-    <div class="service-row service-row-link" data-search="${escHtml(searchText)}"
+    <div class="service-row service-row-link" data-search="${escHtml(searchText)}" data-running="${isServiceRunning(status) ? 1 : 0}"
       onclick="Router.navigate('/stacks/${encodeURIComponent(stackName)}/services/${encodeURIComponent(svcName)}')">
       <div>
         <div class="service-name">${escHtml(svcName)}</div>

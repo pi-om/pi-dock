@@ -777,6 +777,29 @@ tbody td {
 .service-row:last-child { border-bottom: none; }
 .service-row-link { cursor: pointer; }
 
+.seg-control {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--panel-bg);
+}
+.seg-control button {
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 10px;
+  border: none;
+  border-right: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.seg-control button:last-child { border-right: none; }
+.seg-control button:hover { color: var(--text); }
+.seg-control button.active { background: var(--accent-light); color: var(--accent); font-weight: 600; }
+.seg-count { font-size: 10.5px; opacity: 0.75; margin-left: 2px; }
+
 .kv-grid {
   display: grid;
   grid-template-columns: max-content 1fr;
