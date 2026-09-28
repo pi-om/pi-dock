@@ -251,10 +251,14 @@ async function renderImages() {
     return;
   }
 
+  const untaggedCount = images.filter(i => i.untagged).length;
+
   body.innerHTML = `
     <div class="table-wrap">
       <div class="table-toolbar">
-        <span class="table-toolbar-title">Images <span class="tag tag-default" style="margin-left:6px">${images.length}</span></span>
+        <span class="table-toolbar-title">Images <span class="tag tag-default" style="margin-left:6px">${images.length}</span>
+          ${untaggedCount ? `<span class="tag tag-orange" style="margin-left:4px" title="Listed after the tagged images">${untaggedCount} untagged</span>` : ''}
+        </span>
         <input class="search-input" id="img-search" placeholder="Search images…" />
         <div class="dropdown-wrap" id="add-img-wrap">
           <button class="btn btn-primary btn-sm" onclick="toggleAddImageMenu(event)">
@@ -296,17 +300,41 @@ async function renderImages() {
   });
 }
 
+const IMAGE_HINT_SOURCE = {
+  digest: 'registry',
+  container: 'in use as',
+  label: 'label',
+  layers: 'older build?',
+};
+
 function imgRow(img) {
-  const tags = img.tags.map(t =>
-    `<span class="tag tag-accent">${escHtml(t)}</span>`
-  ).join('');
-  const repoShort = img.repository.length > 50
-    ? '…' + img.repository.slice(-48) : img.repository;
+  const usedBy = img.used_by || [];
+  const usage = usedBy.length
+    ? `<span class="tag tag-green" style="font-size:10px" title="${escHtml(usedBy.join('\n'))}">in use · ${usedBy.length}</span>`
+    : '';
+
+  let repoCell;
+  if (img.untagged) {
+    const hint = img.hint;
+    repoCell = hint
+      ? `<span class="mono" title="${escHtml(hint.detail)}">${escHtml(hint.name)}</span>
+         <span class="tag tag-default" style="font-size:10px;margin-left:4px" title="${escHtml(hint.detail)}">${IMAGE_HINT_SOURCE[hint.source] || hint.source}</span>`
+      : `<span class="text-muted mono" title="No tag, registry digest, label, or matching tagged image">unknown image</span>`;
+  } else {
+    const repoShort = img.repository.length > 50 ? '…' + img.repository.slice(-48) : img.repository;
+    repoCell = `<span class="mono" title="${escHtml(img.repository)}">${escHtml(repoShort)}</span>`;
+  }
+
+  const tags = img.untagged
+    ? `<span class="tag tag-orange" title="This image has no tag — usually replaced by a newer pull/build of the same tag">untagged</span>`
+    : img.tags.map(t => `<span class="tag tag-accent">${escHtml(t)}</span>`).join('');
+
   return `
-    <tr>
+    <tr${img.untagged ? ' class="row-untagged"' : ''}>
       <td>
-        <span class="mono" title="${escHtml(img.repository)}">${escHtml(repoShort)}</span>
+        ${repoCell}
         <br><span class="text-muted mono" style="font-size:10px">${escHtml(img.id)}</span>
+        ${usage ? ` ${usage}` : ''}
       </td>
       <td>${tags || '<span class="text-muted">—</span>'}</td>
       <td><span class="text-muted">${fmtSize(img.size_mb)}</span></td>
@@ -912,7 +940,7 @@ function renderImageOptions(images) {
     list.innerHTML = `<div class="text-muted" style="padding:12px">No images found.</div>`;
     return;
   }
-  list.innerHTML = images.map(img => {
+  list.innerHTML = images.filter(img => !img.untagged).map(img => {
     return img.tags.map(t => {
       const full = `${img.repository}:${t}`;
       const sel = full === window._selectedImage ? 'selected' : '';

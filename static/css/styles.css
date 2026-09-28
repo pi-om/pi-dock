@@ -761,6 +761,7 @@ tbody td {
 .kv-val { color: var(--text); word-break: break-all; white-space: pre-wrap; }
 
 tr.row-highlight td { background: #f5f7ff; }
+tr.row-untagged td { background: #fcfcfd; }
 .service-row:hover { background: #f5f7ff; }
 
 .service-name {

@@ -151,33 +151,116 @@ def require_compose(stack: dict):
 
 # ── Images ──────────────────────────────────────────────────────────────────
 
+# Image layers never change for a given image ID, so inspect each image once
+_image_layers_cache: dict[str, list[str]] = {}
+
+
+def image_layers(client, image_id: str) -> list[str]:
+    if image_id not in _image_layers_cache:
+        try:
+            _image_layers_cache[image_id] = client.api.inspect_image(image_id).get("RootFS", {}).get("Layers", [])
+        except docker.errors.APIError:
+            return []
+    return _image_layers_cache[image_id]
+
+
+def common_prefix_len(a: list, b: list) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def guess_untagged_image(client, img: dict, used_refs: list[str], tagged: list[dict]) -> Optional[dict]:
+    """Best available name for an untagged image, most reliable source first."""
+    digests = [d for d in (img.get("RepoDigests") or []) if not d.startswith("<none>")]
+    if digests:
+        return {"name": digests[0].split("@")[0], "source": "digest",
+                "detail": f"Pulled as {digests[0][:80]}"}
+
+    refs = [r for r in used_refs if not r.startswith("sha256:")]
+    if refs:
+        return {"name": strip_digest(refs[0]), "source": "container",
+                "detail": f"Containers reference it as {refs[0][:80]}"}
+
+    labels = img.get("Labels") or {}
+    title = labels.get("org.opencontainers.image.title")
+    if title:
+        version = labels.get("org.opencontainers.image.version") or labels.get("org.opencontainers.image.revision", "")[:12]
+        source = labels.get("org.opencontainers.image.source", "")
+        return {"name": f"{title}:{version}" if version else title, "source": "label",
+                "detail": f"OCI label title{f' — {source}' if source else ''}"}
+
+    # An older build of a tagged image shares most of its layers with it. Only
+    # trust that when the best matches are builds of one or two apps — a prefix
+    # shared by many unrelated images is just a common base image
+    layers = image_layers(client, img["Id"])
+    if len(layers) >= 3:
+        scored = [(common_prefix_len(layers, image_layers(client, t["Id"])), t) for t in tagged]
+        best_n = max((n for n, _ in scored), default=0)
+        matches = sorted((t for n, t in scored if n == best_n), key=lambda t: t.get("Created", 0), reverse=True)
+        app_names = {
+            tag.rsplit(":", 1)[0].split("/")[-1]
+            for t in matches for tag in t["RepoTags"] if tag != "<none>:<none>"
+        }
+        if best_n >= 3 and best_n / len(layers) >= 0.5 and (len(matches) <= 3 or len(app_names) <= 2):
+            tag = next(t for t in matches[0]["RepoTags"] if t != "<none>:<none>")
+            others = sorted(app_names - {tag.rsplit(":", 1)[0].split("/")[-1]})
+            also = f" (also matches {', '.join(others)})" if others else ""
+            return {"name": tag.rsplit(":", 1)[0], "source": "layers",
+                    "detail": f"Likely an older build of {tag} — shares {best_n}/{len(layers)} layers{also}"}
+
+    ref_name = labels.get("org.opencontainers.image.ref.name")
+    if ref_name:
+        return {"name": ref_name, "source": "label", "detail": "Built on this base image (OCI ref.name label)"}
+    return None
+
+
 @app.get("/api/images")
 def list_images():
     client = docker_client()
+    raw_images = client.api.images()
+
+    used_by: dict[str, list[str]] = {}
+    used_refs: dict[str, list[str]] = {}
+    for c in client.api.containers(all=True):
+        name = (c.get("Names") or ["/" + c["Id"][:12]])[0].lstrip("/")
+        used_by.setdefault(c["ImageID"], []).append(name)
+        used_refs.setdefault(c["ImageID"], []).append(c.get("Image", ""))
+
+    def real_tags(img):
+        return [t for t in (img.get("RepoTags") or []) if t != "<none>:<none>"]
+
+    tagged = [i for i in raw_images if real_tags(i)]
     images = []
-    for img in client.images.list():
-        size_mb = round(img.attrs.get("Size", 0) / (1024 * 1024), 1)
-        created = img.attrs.get("Created", "")
-        tags = img.tags if img.tags else ["<none>:<none>"]
+    for img in raw_images:
+        image_id = img["Id"].replace("sha256:", "")[:12]
+        common = {
+            "id": image_id,
+            "size_mb": round(img.get("Size", 0) / (1024 * 1024), 1),
+            "created": datetime.fromtimestamp(img.get("Created", 0)).isoformat(),
+            "used_by": sorted(used_by.get(img["Id"], [])),
+        }
+        tags = real_tags(img)
+        if not tags:
+            refs = sorted(set(used_refs.get(img["Id"], [])))
+            images.append({**common, "repository": "<none>", "tags": [], "untagged": True,
+                           "hint": guess_untagged_image(client, img, refs, tagged)})
+            continue
 
         by_repo: dict[str, list[str]] = {}
         for tag in tags:
-            if ":" in tag:
-                repo, t = tag.rsplit(":", 1)
-            else:
-                repo, t = tag, "latest"
+            repo, t = tag.rsplit(":", 1) if ":" in tag.split("/")[-1] else (tag, "latest")
             by_repo.setdefault(repo, []).append(t)
-
         for repo, repo_tags in by_repo.items():
-            images.append({
-                "id": img.short_id.replace("sha256:", ""),
-                "repository": repo,
-                "tags": repo_tags,
-                "size_mb": size_mb,
-                "created": created,
-            })
+            images.append({**common, "repository": repo, "tags": repo_tags, "untagged": False, "hint": None})
 
-    return sorted(images, key=lambda x: x["repository"].lower())
+    # Tagged images alphabetically, then untagged ones newest first
+    tagged_rows = sorted((i for i in images if not i["untagged"]), key=lambda x: x["repository"].lower())
+    untagged_rows = sorted((i for i in images if i["untagged"]), key=lambda x: x["created"], reverse=True)
+    return tagged_rows + untagged_rows
 
 
 # ── Containers ───────────────────────────────────────────────────────────────
