@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import docker
@@ -623,16 +623,35 @@ def pull_image(name: str = Form(...)):
 
 # ── Static SPA (must be last) ─────────────────────────────────────────────────
 
+STATIC_DIR = Path(__file__).parent / "static"
+ASSET_REF_RE = re.compile(r'((?:src|href)="/((?:js|css)/[^"?]+))"')
+
+
+def index_response() -> HTMLResponse:
+    # Tag each /js and /css reference with its mtime so a changed file gets a new URL
+    # and browsers can't keep running a stale cached copy after a deploy
+    html = (STATIC_DIR / "index.html").read_text()
+
+    def versioned(m: re.Match) -> str:
+        asset = STATIC_DIR / m.group(2)
+        version = int(asset.stat().st_mtime) if asset.exists() else 0
+        return f'{m.group(1)}?v={version}"'
+
+    return HTMLResponse(ASSET_REF_RE.sub(versioned, html), headers={"Cache-Control": "no-cache"})
+
+
 class SPAStaticFiles(StaticFiles):
     """Serve index.html for unknown non-API paths so client-side routes survive a reload."""
 
     async def get_response(self, path, scope):
+        if path in ("", ".", "index.html"):
+            return index_response()
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as e:
             if e.status_code != 404 or path.startswith("api"):
                 raise
-            response = await super().get_response("index.html", scope)
+            return index_response()
         # Revalidate with the ETag on every load so a deploy never leaves stale JS in the browser
         response.headers["Cache-Control"] = "no-cache"
         return response
