@@ -29,7 +29,20 @@ def docker_client():
     return docker.from_env()
 
 
-def get_stacks_list():
+def run_json_lines(cmd):
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return []
+    rows = []
+    for line in proc.stdout.strip().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass
+    return rows
+
+
+def get_compose_stacks():
     proc = subprocess.run(
         ["docker", "compose", "ls", "--all", "--format", "json"],
         capture_output=True, text=True,
@@ -38,9 +51,99 @@ def get_stacks_list():
         return []
     try:
         result = json.loads(proc.stdout)
-        return result if isinstance(result, list) else []
     except Exception:
         return []
+    if not isinstance(result, list):
+        return []
+    for stack in result:
+        stack["Type"] = "compose"
+    return result
+
+
+def parse_replicas(replicas: str):
+    # "1/1" or "1/1 (max 1 per node)"
+    m = re.match(r"(\d+)/(\d+)", replicas or "")
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def parse_swarm_ports(ports: str):
+    # "*:5005->5005/tcp, *:9443->9443/tcp"
+    publishers = []
+    for part in (ports or "").split(","):
+        m = re.search(r":(\d+)->(\d+)", part)
+        if m:
+            publishers.append({"PublishedPort": int(m.group(1)), "TargetPort": int(m.group(2))})
+    return publishers
+
+
+def swarm_service_state(running: int, desired: int) -> str:
+    if desired == 0:
+        return f"stopped ({running}/{desired})"
+    if running >= desired:
+        return f"running ({running}/{desired})"
+    if running == 0:
+        return f"exited ({running}/{desired})"
+    return f"degraded ({running}/{desired})"
+
+
+def get_swarm_services(stack_name: str):
+    services = []
+    for svc in run_json_lines(["docker", "stack", "services", stack_name, "--format", "json"]):
+        running, desired = parse_replicas(svc.get("Replicas", ""))
+        full_name = svc.get("Name", "")
+        prefix = f"{stack_name}_"
+        services.append({
+            "Service": full_name[len(prefix):] if full_name.startswith(prefix) else full_name,
+            "Name": full_name,
+            "Image": (svc.get("Image") or "").split("@sha256:")[0],
+            "Mode": svc.get("Mode", ""),
+            "Replicas": svc.get("Replicas", ""),
+            "Running": running,
+            "Desired": desired,
+            "State": swarm_service_state(running, desired),
+            "Publishers": parse_swarm_ports(svc.get("Ports", "")),
+        })
+    return services
+
+
+def get_swarm_stacks():
+    stacks = []
+    for row in run_json_lines(["docker", "stack", "ls", "--format", "json"]):
+        name = row.get("Name")
+        if not name:
+            continue
+        services = get_swarm_services(name)
+        up = sum(1 for s in services if s["Desired"] > 0 and s["Running"] >= s["Desired"])
+        down = sum(1 for s in services if s["Running"] < s["Desired"])
+        any_running = any(s["Running"] > 0 for s in services)
+        stacks.append({
+            "Name": name,
+            "Status": f"{'running' if any_running else 'exited'}({len(services)})",
+            "ConfigFiles": "",
+            "Type": "swarm",
+            "ServicesUp": up,
+            "ServicesDown": down,
+        })
+    return stacks
+
+
+def get_stacks_list():
+    return get_compose_stacks() + get_swarm_stacks()
+
+
+def find_stack(stack_name: str) -> dict:
+    stack = next((s for s in get_stacks_list() if s.get("Name") == stack_name), None)
+    if not stack:
+        raise HTTPException(status_code=404, detail="Stack not found")
+    return stack
+
+
+def require_compose(stack: dict):
+    if stack.get("Type") == "swarm":
+        raise HTTPException(
+            status_code=400,
+            detail="Swarm stacks don't keep a compose file on disk — use Update Image per service instead",
+        )
 
 
 # ── Images ──────────────────────────────────────────────────────────────────
@@ -165,10 +268,18 @@ def list_stacks():
 
 @app.get("/api/stacks/{stack_name}")
 def get_stack(stack_name: str):
-    stacks = get_stacks_list()
-    stack = next((s for s in stacks if s.get("Name") == stack_name), None)
-    if not stack:
-        raise HTTPException(status_code=404, detail="Stack not found")
+    stack = find_stack(stack_name)
+
+    if stack.get("Type") == "swarm":
+        services = get_swarm_services(stack_name)
+        return {
+            "name": stack_name,
+            "type": "swarm",
+            "config_file": "",
+            "status": stack.get("Status", ""),
+            "services": services,
+            "service_images": {s["Service"]: s["Image"] for s in services},
+        }
 
     config_files = stack.get("ConfigFiles", "")
     compose_file = config_files.split(",")[0].strip() if config_files else ""
@@ -203,6 +314,7 @@ def get_stack(stack_name: str):
 
     return {
         "name": stack_name,
+        "type": "compose",
         "config_file": compose_file,
         "status": stack.get("Status", ""),
         "services": services,
@@ -212,10 +324,8 @@ def get_stack(stack_name: str):
 
 @app.post("/api/stacks/{stack_name}/update-compose")
 async def update_compose(stack_name: str, file: UploadFile = File(...)):
-    stacks = get_stacks_list()
-    stack = next((s for s in stacks if s.get("Name") == stack_name), None)
-    if not stack:
-        raise HTTPException(status_code=404, detail="Stack not found")
+    stack = find_stack(stack_name)
+    require_compose(stack)
 
     config_files = stack.get("ConfigFiles", "")
     compose_file = config_files.split(",")[0].strip()
@@ -247,10 +357,10 @@ def update_service_image(
     service_name: str,
     image: str = Form(...),
 ):
-    stacks = get_stacks_list()
-    stack = next((s for s in stacks if s.get("Name") == stack_name), None)
-    if not stack:
-        raise HTTPException(status_code=404, detail="Stack not found")
+    stack = find_stack(stack_name)
+
+    if stack.get("Type") == "swarm":
+        return update_swarm_service_image(stack_name, service_name, image)
 
     config_files = stack.get("ConfigFiles", "")
     compose_file = config_files.split(",")[0].strip()
@@ -287,17 +397,37 @@ def update_service_image(
 
     return {
         "success": True,
+        "type": "compose",
         "pull_output": pull.stdout,
         "deploy_output": deploy.stdout,
     }
 
 
+def update_swarm_service_image(stack_name: str, service_name: str, image: str):
+    full_name = f"{stack_name}_{service_name}"
+    if not any(s["Name"] == full_name for s in get_swarm_services(stack_name)):
+        raise HTTPException(status_code=404, detail="Service not found in stack")
+
+    # --detach=false waits for the rolling update so a failed rollout is reported
+    try:
+        deploy = subprocess.run(
+            ["docker", "service", "update", "--image", image,
+             "--with-registry-auth", "--detach=false", "--quiet", full_name],
+            capture_output=True, text=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Service update still converging after 10 min — check the stack page")
+
+    if deploy.returncode != 0:
+        raise HTTPException(status_code=500, detail=deploy.stderr or deploy.stdout or "Service update failed")
+
+    return {"success": True, "type": "swarm", "pull_output": "", "deploy_output": deploy.stdout}
+
+
 @app.get("/api/stacks/{stack_name}/compose/download")
 def download_compose(stack_name: str):
-    stacks = get_stacks_list()
-    stack = next((s for s in stacks if s.get("Name") == stack_name), None)
-    if not stack:
-        raise HTTPException(status_code=404, detail="Stack not found")
+    stack = find_stack(stack_name)
+    require_compose(stack)
 
     config_files = stack.get("ConfigFiles", "")
     compose_file = config_files.split(",")[0].strip()

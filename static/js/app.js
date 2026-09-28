@@ -22,7 +22,7 @@ function statusColor(state) {
   const s = state.toLowerCase();
   if (s.includes('running') || s.includes('up')) return 'green';
   if (s.includes('exit') || s.includes('stop')) return 'red';
-  if (s.includes('restarting') || s.includes('paused')) return 'orange';
+  if (s.includes('restarting') || s.includes('paused') || s.includes('degraded')) return 'orange';
   return 'gray';
 }
 
@@ -179,7 +179,7 @@ async function renderDashboard() {
         <div class="empty-state">
           <div class="empty-state-icon">📦</div>
           <h3>No stacks found</h3>
-          <p>Start a Docker Compose stack to see it here.</p>
+          <p>Start a Docker Compose or Swarm stack to see it here.</p>
         </div>
       </div>` : `
       <div class="stack-grid">
@@ -193,9 +193,13 @@ function stackCard(s) {
   const color = statusColor(s.Status);
   const label = statusLabel(s.Status);
   const svcCount = (s.Status || '').match(/\((\d+)\)/)?.[1] || '?';
+  const isSwarm = s.Type === 'swarm';
   return `
     <div class="stack-card" onclick="Router.navigate('/stacks/${encodeURIComponent(s.Name)}')">
-      <div class="stack-card-name">${escHtml(s.Name)}</div>
+      <div class="stack-card-name">
+        ${escHtml(s.Name)}
+        ${isSwarm ? '<span class="tag tag-accent" style="margin-left:6px;font-size:10px">swarm</span>' : ''}
+      </div>
       <div>
         <span class="status-dot">
           <span class="dot dot-${color}"></span>
@@ -205,6 +209,7 @@ function stackCard(s) {
       <div class="stack-card-meta">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
         ${svcCount} service${svcCount === '1' ? '' : 's'}
+        ${isSwarm && s.ServicesDown ? `<span class="text-orange">· ${s.ServicesDown} down</span>` : ''}
       </div>
     </div>`;
 }
@@ -247,7 +252,7 @@ async function renderImages() {
             <div class="dropdown-divider"></div>
             <div class="dropdown-item" onclick="closeAddMenu();openPullImageModal()">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="8 17 12 21 16 17"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
-              Pull Image
+              Pull Images
             </div>
           </div>
         </div>
@@ -449,7 +454,7 @@ async function doStartContainer(id, name) {
 
 async function renderStacks() {
   setActiveNav('stacks');
-  setTopbar('Stacks', 'Docker Compose stacks on this host');
+  setTopbar('Stacks', 'Docker Compose & Swarm stacks on this host');
 
   const body = $('#page-body');
   body.innerHTML = `<div class="loading-state"><div class="spinner"></div>Loading stacks…</div>`;
@@ -462,7 +467,7 @@ async function renderStacks() {
     body.innerHTML = `<div class="empty-state">
       <div class="empty-state-icon">📦</div>
       <h3>No stacks found</h3>
-      <p>Run <code>docker compose up -d</code> to start a stack.</p>
+      <p>Run <code>docker compose up -d</code> or <code>docker stack deploy</code> to start a stack.</p>
     </div>`;
     return;
   }
@@ -508,6 +513,7 @@ async function renderStackDetail({ name }) {
   const allServices = [...new Set([...serviceNames, ...Object.keys(svcStatus)])];
 
   const color = statusColor(stack.status);
+  const isSwarm = stack.type === 'swarm';
 
   body.innerHTML = `
     <div class="flex items-center gap-2 mb-5">
@@ -518,7 +524,9 @@ async function renderStackDetail({ name }) {
         <span class="dot dot-${color}"></span>
         <span style="font-size:16px;font-weight:700;">${escHtml(name)}</span>
         <span class="tag tag-default">${escHtml(stack.status || 'unknown')}</span>
+        ${isSwarm ? '<span class="tag tag-accent">swarm</span>' : ''}
       </div>
+      ${isSwarm ? '' : `
       <div class="ml-auto flex gap-2">
         <a href="${API.stacks.downloadComposeUrl(name)}" download="${escHtml(name)}-compose.yml"
            class="btn btn-ghost btn-sm">
@@ -527,7 +535,7 @@ async function renderStackDetail({ name }) {
         <button class="btn btn-primary btn-sm" onclick="openUploadCompose('${escHtml(name)}')">
           ↑ Upload New Compose
         </button>
-      </div>
+      </div>`}
     </div>
 
     <div class="card mb-5">
@@ -554,7 +562,10 @@ async function renderStackDetail({ name }) {
 
 function serviceRow(stackName, svcName, currentImage, status) {
   const color = status ? statusColor(status.State || status.Status || '') : 'gray';
-  const label = status ? statusLabel(status.State || status.Status || '') : 'not deployed';
+  // Swarm services carry their replica count in State, e.g. "running (1/1)"
+  const label = status
+    ? (status.Replicas ? status.State : statusLabel(status.State || status.Status || ''))
+    : 'not deployed';
   const ports = status?.Publishers?.map(p => `${p.PublishedPort || ''}:${p.TargetPort}`).filter(Boolean).join(', ') || '';
 
   return `
@@ -698,8 +709,8 @@ async function deployImageUpdate(stackName, serviceName) {
     const res = await API.stacks.updateServiceImage(stackName, serviceName, image);
     Modal.close();
     Toast.success(`Deployed ${serviceName} → ${image}`);
-    // Show download option
-    setTimeout(() => showPostDeployBanner(stackName), 300);
+    // Show download option (swarm stacks have no compose file to download)
+    if (res.type !== 'swarm') setTimeout(() => showPostDeployBanner(stackName), 300);
     // Refresh page
     setTimeout(() => renderStackDetail({ name: stackName }), 800);
   } catch (e) {
@@ -996,33 +1007,41 @@ async function loadTarFiles() {
 function openPullImageModal() {
   Modal.open(`
     <div class="modal-header">
-      <span class="modal-title">Pull Docker Image</span>
+      <span class="modal-title">Pull Docker Images</span>
       <button class="btn-icon" onclick="Modal.close()">✕</button>
     </div>
     <div class="modal-body" id="pull-modal-body">
       <div class="form-group">
-        <label class="form-label">Image name</label>
-        <input class="form-input" id="pull-image-name"
-          placeholder="e.g. nginx:latest, ubuntu:22.04, ghcr.io/user/repo:tag"
-          onkeydown="if(event.key==='Enter') doPullImage()" />
+        <label class="form-label">Image names — one per line</label>
+        <textarea class="form-input" id="pull-image-name" rows="5" spellcheck="false"
+          style="resize:vertical;font-family:'SF Mono','Fira Code',monospace"
+          placeholder="nginx:latest&#10;ubuntu:22.04&#10;ghcr.io/user/repo:tag"
+          onkeydown="if(event.key==='Enter' && (event.metaKey||event.ctrlKey)) doPullImage()"></textarea>
       </div>
       <div style="font-size:11.5px;color:var(--text-muted);margin-top:-6px">
-        Press Enter or click Pull — tag defaults to <code>latest</code> if omitted.
+        Press ⌘/Ctrl+Enter or click Pull — tag defaults to <code>latest</code> if omitted.
       </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
       <button class="btn btn-primary" id="pull-btn" onclick="doPullImage()">
-        ↓ Pull Image
+        ↓ Pull
       </button>
     </div>
   `);
   setTimeout(() => $('#pull-image-name')?.focus(), 80);
 }
 
+function parseImageNames(text) {
+  const names = (text || '').split(/\s+/).map(n => n.trim()).filter(Boolean);
+  return [...new Set(names)];
+}
+
 async function doPullImage() {
-  const name = $('#pull-image-name')?.value?.trim();
-  if (!name) { Toast.error('Enter an image name first.'); return; }
+  const names = parseImageNames($('#pull-image-name')?.value);
+  if (!names.length) { Toast.error('Enter an image name first.'); return; }
+  if (names.length > 1) return doPullImages(names);
+  const name = names[0];
 
   const btn = $('#pull-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spinner" style="width:14px;height:14px"></div> Pulling…'; }
@@ -1065,6 +1084,50 @@ async function doPullImage() {
     `;
     Toast.error(`Pull failed: ${e.message.slice(0, 60)}`);
   }
+}
+
+async function doPullImages(names) {
+  const body = $('#pull-modal-body');
+  const footer = document.querySelector('#modal-overlay .modal-footer');
+  body.innerHTML = `
+    <div style="margin-bottom:12px;font-size:13px;font-weight:600">Pulling ${names.length} images…</div>
+    <div class="tar-file-list">
+      ${names.map((n, i) => `
+        <div class="tar-file-item">
+          <span id="pull-icon-${i}" style="font-size:16px">⏳</span>
+          <span class="tar-file-name">${escHtml(n)}</span>
+          <span class="tar-file-size" id="pull-status-${i}">waiting…</span>
+        </div>`).join('')}
+    </div>
+  `;
+  if (footer) footer.innerHTML = '';
+
+  let failed = 0;
+  for (let i = 0; i < names.length; i++) {
+    const icon = $(`#pull-icon-${i}`);
+    const status = $(`#pull-status-${i}`);
+    if (status) status.textContent = 'pulling…';
+    try {
+      await API.images.pull(names[i]);
+      if (icon) icon.textContent = '✅';
+      if (status) { status.textContent = 'done'; status.style.color = 'var(--green)'; }
+    } catch (e) {
+      failed++;
+      if (icon) icon.textContent = '❌';
+      if (status) {
+        status.textContent = e.message.slice(0, 40);
+        status.title = e.message;
+        status.style.color = 'var(--red)';
+      }
+    }
+  }
+
+  const pulled = names.length - failed;
+  if (failed === 0) Toast.success(`Pulled ${pulled} images`);
+  else Toast.error(`${failed} of ${names.length} pulls failed`);
+  if (footer) footer.innerHTML = `<button class="btn btn-primary" onclick="Modal.close();renderImages()">
+    ${failed === 0 ? '✓ Done — Refresh Images' : `Close — ${pulled} of ${names.length} pulled`}
+  </button>`;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
