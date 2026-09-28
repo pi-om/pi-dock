@@ -628,11 +628,14 @@ class SPAStaticFiles(StaticFiles):
 
     async def get_response(self, path, scope):
         try:
-            return await super().get_response(path, scope)
+            response = await super().get_response(path, scope)
         except StarletteHTTPException as e:
-            if e.status_code == 404 and not path.startswith("api"):
-                return await super().get_response("index.html", scope)
-            raise
+            if e.status_code != 404 or path.startswith("api"):
+                raise
+            response = await super().get_response("index.html", scope)
+        # Revalidate with the ETag on every load so a deploy never leaves stale JS in the browser
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 app.mount("/", SPAStaticFiles(directory="static", html=True), name="static")
