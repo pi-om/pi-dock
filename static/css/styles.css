@@ -545,6 +545,52 @@ tbody td {
 
 .modal-body { padding: 18px 20px; }
 
+/* ── Deploy compose ──────────────────────────────────────────────────────── */
+.modal:has(.deploy-view) { width: 860px; }
+.modal:has(.deploy-view) .modal-body { max-height: 70vh; overflow-y: auto; }
+.fs-list {
+  max-height: 46vh;
+  overflow-y: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+}
+.fs-row {
+  display: grid;
+  grid-template-columns: 22px 1fr auto;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+  cursor: pointer;
+}
+.fs-row:last-child { border-bottom: none; }
+.fs-row:hover { background: #f5f7ff; }
+.fs-name { word-break: break-all; }
+.deploy-group {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.deploy-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 8px 12px;
+  background: var(--panel-bg);
+  color: var(--text);
+}
+.deploy-svc {
+  display: grid;
+  grid-template-columns: minmax(160px, 30%) 1fr;
+  gap: 12px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+.deploy-svc-name { font-weight: 600; word-break: break-all; }
+.deploy-svc-img { word-break: break-all; }
+
 /* ── Env viewer ──────────────────────────────────────────────────────────── */
 .modal:has(.env-view) { width: 820px; }
 .env-list {

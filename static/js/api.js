@@ -48,15 +48,26 @@ const API = {
     start: (id) => API.post(`/api/containers/${encodeURIComponent(id)}/start`, {}),
   },
 
+  fs: {
+    browse: (path = '') => API.get(`/api/fs/browse?path=${encodeURIComponent(path)}`),
+  },
+
   stacks: {
     list: () => API.get('/api/stacks'),
     get: (name) => API.get(`/api/stacks/${encodeURIComponent(name)}`),
     service: (stackName, serviceName) =>
       API.get(`/api/stacks/${encodeURIComponent(stackName)}/services/${encodeURIComponent(serviceName)}`),
-    uploadCompose: (name, file) => {
+    previewDeploy: (name, { file, path }) => {
       const fd = new FormData();
-      fd.append('file', file);
-      return API.post(`/api/stacks/${encodeURIComponent(name)}/update-compose`, fd, true);
+      if (file) fd.append('file', file);
+      if (path) fd.append('path', path);
+      return API.post(`/api/stacks/${encodeURIComponent(name)}/deploy/preview`, fd, true);
+    },
+    deploy: (name, path, prune) => {
+      const fd = new FormData();
+      fd.append('path', path);
+      fd.append('prune', prune ? 'true' : 'false');
+      return API.post(`/api/stacks/${encodeURIComponent(name)}/deploy`, fd, true);
     },
     updateServiceImage: (stackName, serviceName, image) => {
       const fd = new FormData();

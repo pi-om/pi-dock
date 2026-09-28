@@ -614,16 +614,16 @@ async function renderStackDetail({ name }) {
         <span class="tag tag-default">${escHtml(stack.status || 'unknown')}</span>
         ${isSwarm ? '<span class="tag tag-accent">swarm</span>' : ''}
       </div>
-      ${isSwarm ? '' : `
       <div class="ml-auto flex gap-2">
+        ${isSwarm ? '' : `
         <a href="${API.stacks.downloadComposeUrl(name)}" download="${escHtml(name)}-compose.yml"
            class="btn btn-ghost btn-sm">
           ↓ Download Compose
-        </a>
-        <button class="btn btn-primary btn-sm" onclick="openUploadCompose('${escHtml(name)}')">
-          ↑ Upload New Compose
+        </a>`}
+        <button class="btn btn-primary btn-sm" onclick="openDeployCompose('${escHtml(name)}', '${escHtml(stack.type)}')">
+          ⇪ Deploy New Compose
         </button>
-      </div>`}
+      </div>
     </div>
 
     <div class="card mb-5">
@@ -984,38 +984,58 @@ function showPostDeployBanner(stackName) {
   body.insertBefore(banner, body.firstChild);
 }
 
-function openUploadCompose(stackName) {
-  let fileName = '';
+// ── Deploy new compose (upload or pick a file on the server) ──────────────────
+
+const deployState = { stack: '', type: '', preview: null, browsePath: '' };
+
+function openDeployCompose(stackName, stackType) {
+  Object.assign(deployState, { stack: stackName, type: stackType, preview: null });
+  let lastDir = '';
+  try { lastDir = localStorage.getItem(`deploy-dir:${stackName}`) || ''; } catch {}
+
   Modal.open(`
-    <div class="modal-header">
-      <span class="modal-title">Upload New Compose</span>
+    <div class="modal-header deploy-view">
+      <span class="modal-title">Deploy New Compose — ${escHtml(stackName)}</span>
       <button class="btn-icon" onclick="Modal.close()">✕</button>
     </div>
-    <div class="modal-body">
-      <p class="text-muted" style="font-size:13px;margin-bottom:14px">
-        Upload a new <code>docker-compose.yml</code> to replace the current one and redeploy
-        <strong>${escHtml(stackName)}</strong>.
-      </p>
-      <div class="drop-zone" id="drop-zone" onclick="$('#compose-file-input').click()">
-        <div class="drop-zone-icon">📄</div>
-        <div id="drop-zone-label">Click or drag a compose file here</div>
-        <div class="text-muted" style="font-size:11px;margin-top:4px">YAML files only</div>
+    <div class="modal-body" id="deploy-body">
+      <div class="tab-bar">
+        <div class="tab active" onclick="switchDeployTab(event,'upload')">Upload from this computer</div>
+        <div class="tab" onclick="switchDeployTab(event,'browse')">Browse server</div>
       </div>
-      <input type="file" id="compose-file-input" accept=".yml,.yaml" style="display:none"
-        onchange="handleComposeFileSelect(this)" />
+
+      <div id="deploy-tab-upload">
+        <div class="drop-zone" id="drop-zone" onclick="$('#compose-file-input').click()">
+          <div class="drop-zone-icon">📄</div>
+          <div>Click or drag a compose file here</div>
+          <div class="text-muted" style="font-size:11px;margin-top:4px">
+            .yml / .yaml — relative paths in it resolve against the stack's original folder when known
+          </div>
+        </div>
+        <input type="file" id="compose-file-input" accept=".yml,.yaml" style="display:none"
+          onchange="if (this.files[0]) previewDeploy({ file: this.files[0] })" />
+      </div>
+
+      <div id="deploy-tab-browse" style="display:none">
+        <div class="flex gap-2 mb-3">
+          <button class="btn btn-ghost btn-sm" id="fs-up" title="Parent folder">↑</button>
+          <input class="form-input mono" id="fs-path" style="flex:1;padding:6px 10px;font-size:12px"
+            onkeydown="if(event.key==='Enter') browseServer(this.value)" />
+          <button class="btn btn-ghost btn-sm" onclick="browseServer('')">Home</button>
+          <button class="btn btn-ghost btn-sm" onclick="browseServer('/data')">/data</button>
+        </div>
+        <div class="fs-list" id="fs-list"><div class="text-muted" style="padding:12px">Loading…</div></div>
+        <div class="text-muted" style="font-size:11px;margin-top:6px">
+          Showing folders and .yml / .yaml files. The file is deployed in place, so its relative paths keep working.
+        </div>
+      </div>
     </div>
-    <div class="modal-footer">
+    <div class="modal-footer" id="deploy-footer">
       <button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
-      <button class="btn btn-primary" id="upload-btn" disabled
-        onclick="deployUploadedCompose('${escHtml(stackName)}')">
-        Deploy
-      </button>
     </div>
   `);
 
-  window._composeFile = null;
-
-  // Drag & drop
+  deployState.browsePath = lastDir;
   const dz = $('#drop-zone');
   dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.classList.add('drag-over'); });
   dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
@@ -1023,34 +1043,164 @@ function openUploadCompose(stackName) {
     e.preventDefault();
     dz.classList.remove('drag-over');
     const f = e.dataTransfer.files[0];
-    if (f) selectComposeFile(f);
+    if (f) previewDeploy({ file: f });
   });
 }
 
-function handleComposeFileSelect(input) {
-  if (input.files[0]) selectComposeFile(input.files[0]);
+function switchDeployTab(event, tab) {
+  $$('#deploy-body .tab').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  $('#deploy-tab-upload').style.display = tab === 'upload' ? '' : 'none';
+  $('#deploy-tab-browse').style.display = tab === 'browse' ? '' : 'none';
+  if (tab === 'browse' && !$('#fs-list').dataset.loaded) browseServer(deployState.browsePath);
 }
 
-function selectComposeFile(file) {
-  window._composeFile = file;
-  $('#drop-zone-label').textContent = `Selected: ${file.name}`;
-  $('#drop-zone').style.borderColor = 'var(--accent)';
-  $('#upload-btn').disabled = false;
+async function browseServer(path) {
+  const list = $('#fs-list');
+  if (!list) return;
+  list.innerHTML = `<div class="text-muted" style="padding:12px">Loading…</div>`;
+  let res;
+  try { res = await API.fs.browse(path); }
+  catch (e) {
+    list.innerHTML = `<div style="padding:12px;color:var(--red)">${escHtml(e.message)}</div>`;
+    return;
+  }
+  list.dataset.loaded = '1';
+  deployState.browsePath = res.path;
+  try { localStorage.setItem(`deploy-dir:${deployState.stack}`, res.path); } catch {}
+
+  $('#fs-path').value = res.path;
+  const up = $('#fs-up');
+  up.disabled = !res.parent;
+  up.onclick = () => res.parent && browseServer(res.parent);
+  $$('#deploy-body .tab')[1].textContent = `Browse ${res.host}`;
+
+  window._fsEntries = res.entries;
+  list.innerHTML = res.entries.length ? res.entries.map((e, i) => `
+    <div class="fs-row" onclick="openFsEntry(${i})">
+      <span>${e.type === 'dir' ? '📁' : '📄'}</span>
+      <span class="fs-name${e.type === 'file' ? ' mono' : ''}">${escHtml(e.name)}</span>
+      <span class="text-muted" style="font-size:11px">${e.type === 'file' ? `${(e.size / 1024).toFixed(1)} KB · ` : ''}${new Date(e.modified * 1000).toLocaleDateString()}</span>
+    </div>`).join('')
+    : `<div class="text-muted" style="padding:12px">No folders or compose files here.</div>`;
 }
 
-async function deployUploadedCompose(stackName) {
-  if (!window._composeFile) { Toast.error('No file selected.'); return; }
-  const btn = $('#upload-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Deploying…'; }
+function openFsEntry(i) {
+  const e = (window._fsEntries || [])[i];
+  if (!e) return;
+  if (e.type === 'dir') browseServer(e.path);
+  else previewDeploy({ path: e.path });
+}
+
+async function previewDeploy(source) {
+  const body = $('#deploy-body');
+  const footer = $('#deploy-footer');
+  const backToPicker = () => openDeployCompose(deployState.stack, deployState.type);
+  body.innerHTML = `<div class="loading-state"><div class="spinner"></div>Checking compose file against ${escHtml(deployState.stack)}…</div>`;
+  footer.innerHTML = '';
+
+  let p;
+  try { p = await API.stacks.previewDeploy(deployState.stack, source); }
+  catch (e) {
+    body.innerHTML = `
+      <div style="color:var(--red);font-weight:600;margin-bottom:8px">✕ Can't use this file</div>
+      <div class="pull-output" style="color:#f87171;max-height:300px">${escHtml(e.message)}</div>`;
+    footer.innerHTML = `<button class="btn btn-ghost" id="deploy-back">← Pick another file</button>`;
+    $('#deploy-back').onclick = backToPicker;
+    return;
+  }
+  deployState.preview = p;
+
+  const changed = p.services.filter(s => s.change === 'changed');
+  const added = p.services.filter(s => s.change === 'added');
+  const unchanged = p.services.filter(s => s.change === 'unchanged');
+  const isSwarm = p.type === 'swarm';
+  const pruneFlag = isSwarm ? '--prune' : '--remove-orphans';
+
+  const svcRow = (s) => `
+    <div class="deploy-svc">
+      <span class="deploy-svc-name">${escHtml(s.name)}</span>
+      <span class="mono deploy-svc-img">
+        ${s.change === 'changed'
+          ? `<span class="text-muted">${escHtml(s.current_image)}</span> → <strong>${escHtml(s.image)}</strong>`
+          : escHtml(s.image || '(no image — build)')}
+      </span>
+    </div>`;
+
+  body.innerHTML = `
+    <div class="mb-3" style="font-size:12px">
+      <span class="text-muted">${p.source === 'upload' ? 'Uploaded, saved on the server as' : 'Server file'}</span>
+      <div class="mono" style="margin-top:2px;word-break:break-all">${escHtml(p.path)}</div>
+    </div>
+
+    <div class="flex gap-2 mb-3" style="flex-wrap:wrap">
+      <span class="tag ${changed.length ? 'tag-orange' : 'tag-default'}">${changed.length} image change${changed.length === 1 ? '' : 's'}</span>
+      <span class="tag ${added.length ? 'tag-green' : 'tag-default'}">${added.length} new service${added.length === 1 ? '' : 's'}</span>
+      <span class="tag ${p.not_in_file.length ? 'tag-red' : 'tag-default'}">${p.not_in_file.length} running but not in file</span>
+      <span class="tag tag-default">${unchanged.length} unchanged</span>
+    </div>
+
+    ${changed.length ? `<div class="deploy-group"><div class="deploy-group-title">Image changes</div>${changed.map(svcRow).join('')}</div>` : ''}
+    ${added.length ? `<div class="deploy-group"><div class="deploy-group-title">New services</div>${added.map(svcRow).join('')}</div>` : ''}
+    ${p.not_in_file.length ? `
+      <div class="deploy-group">
+        <div class="deploy-group-title">Running but not in this file</div>
+        <div style="padding:8px 12px;font-size:12px" class="mono">${p.not_in_file.map(escHtml).join(', ')}</div>
+        <label class="flex items-center gap-2" style="padding:0 12px 10px;font-size:12px;cursor:pointer">
+          <input type="checkbox" id="deploy-prune" />
+          <span>Remove these services (<code>${pruneFlag}</code>) — otherwise they keep running untouched</span>
+        </label>
+      </div>` : ''}
+    ${unchanged.length ? `
+      <details class="deploy-group">
+        <summary class="deploy-group-title" style="cursor:pointer">Unchanged (${unchanged.length})</summary>
+        ${unchanged.map(svcRow).join('')}
+      </details>` : ''}
+    ${p.warnings ? `
+      <details class="deploy-group" open>
+        <summary class="deploy-group-title" style="cursor:pointer;color:var(--orange)">Warnings from docker</summary>
+        <div class="pull-output" style="color:#fbbf24;border-radius:0;max-height:140px">${escHtml(p.warnings)}</div>
+      </details>` : ''}
+    <details class="deploy-group">
+      <summary class="deploy-group-title" style="cursor:pointer">View file${p.truncated ? ' (truncated)' : ''}</summary>
+      <div class="pull-output" style="color:#e5e7eb;border-radius:0;max-height:320px">${escHtml(p.content)}</div>
+    </details>
+  `;
+
+  footer.innerHTML = `
+    <button class="btn btn-ghost" id="deploy-back">← Pick another file</button>
+    <button class="btn btn-primary" id="deploy-go">⇪ Deploy to ${escHtml(deployState.stack)}</button>
+  `;
+  $('#deploy-back').onclick = backToPicker;
+  $('#deploy-go').onclick = runDeploy;
+}
+
+async function runDeploy() {
+  const p = deployState.preview;
+  if (!p) return;
+  const prune = !!$('#deploy-prune')?.checked;
+  const body = $('#deploy-body');
+  const footer = $('#deploy-footer');
+  body.innerHTML = `<div class="loading-state"><div class="spinner"></div>Deploying ${escHtml(p.stack)}… this can take a few minutes.</div>`;
+  footer.innerHTML = '';
 
   try {
-    await API.stacks.uploadCompose(stackName, window._composeFile);
-    Modal.close();
-    Toast.success(`Stack ${stackName} redeployed.`);
-    setTimeout(() => renderStackDetail({ name: stackName }), 800);
+    const res = await API.stacks.deploy(p.stack, p.path, prune);
+    body.innerHTML = `
+      <div style="color:var(--green);font-weight:600;margin-bottom:8px">✓ Deployed ${escHtml(p.stack)}</div>
+      <div class="mono text-muted" style="font-size:11px;margin-bottom:8px;word-break:break-all">$ ${escHtml(res.command)}</div>
+      <div class="pull-output" style="max-height:320px">${escHtml(res.output || '(no output)')}</div>`;
+    footer.innerHTML = `<button class="btn btn-primary" onclick="Modal.close();Router._dispatch(location.pathname)">✓ Done — Refresh</button>`;
+    Toast.success(`Deployed ${escHtml(p.stack)}`);
   } catch (e) {
-    Toast.error(e.message);
-    if (btn) { btn.disabled = false; btn.textContent = 'Deploy'; }
+    body.innerHTML = `
+      <div style="color:var(--red);font-weight:600;margin-bottom:8px">✕ Deploy failed</div>
+      <div class="pull-output" style="color:#f87171;max-height:320px">${escHtml(e.message)}</div>`;
+    footer.innerHTML = `
+      <button class="btn btn-ghost" onclick="Modal.close();Router._dispatch(location.pathname)">Close</button>
+      <button class="btn btn-primary" id="deploy-retry">← Back to preview</button>`;
+    $('#deploy-retry').onclick = () => previewDeploy({ path: p.path });
+    Toast.error('Deploy failed');
   }
 }
 

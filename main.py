@@ -11,6 +11,8 @@ import yaml
 import os
 import shutil
 import tempfile
+import socket
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -477,33 +479,185 @@ def get_compose_service_detail(stack: dict, service_name: str):
     }
 
 
-@app.post("/api/stacks/{stack_name}/update-compose")
-async def update_compose(stack_name: str, file: UploadFile = File(...)):
-    stack = find_stack(stack_name)
-    require_compose(stack)
+# ── Stack redeploy from a new compose file ──────────────────────────────────
 
-    config_files = stack.get("ConfigFiles", "")
-    compose_file = config_files.split(",")[0].strip()
+DEPLOY_DIR = Path.home() / ".docker-buddy" / "deployments"
+COMPOSE_SUFFIXES = (".yml", ".yaml")
 
-    content = await file.read()
+
+def resolve_compose_path(path: str) -> Path:
+    p = Path(path).expanduser().resolve()
+    if p.suffix.lower() not in COMPOSE_SUFFIXES:
+        raise HTTPException(status_code=400, detail="Pick a .yml or .yaml file")
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {p}")
+    if not os.access(p, os.R_OK):
+        raise HTTPException(status_code=403, detail=f"No permission to read {p}")
+    return p
+
+
+def compose_working_dir(stack_name: str) -> Optional[str]:
+    client = docker_client()
+    for c in client.containers.list(all=True, filters={"label": f"com.docker.compose.project={stack_name}"}):
+        wd = c.labels.get("com.docker.compose.project.working_dir")
+        if wd:
+            return wd
+    return None
+
+
+def compose_cmd(stack: dict, compose_path: Path) -> list[str]:
+    cmd = ["docker", "compose", "-p", stack["Name"], "-f", str(compose_path)]
+    # Uploaded files live in DEPLOY_DIR; resolve their relative paths against the
+    # stack's original directory rather than the upload folder
+    if DEPLOY_DIR in compose_path.parents:
+        wd = compose_working_dir(stack["Name"])
+        if wd:
+            cmd += ["--project-directory", wd]
+    return cmd
+
+
+def render_compose(stack: dict, compose_path: Path) -> tuple[dict, str]:
+    """Return the file as docker will see it (merged + interpolated) and any warnings."""
+    if stack.get("Type") == "swarm":
+        cmd = ["docker", "stack", "config", "-c", str(compose_path)]
+    else:
+        cmd = compose_cmd(stack, compose_path) + ["config"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=compose_path.parent, timeout=60)
+    if proc.returncode != 0:
+        raise HTTPException(status_code=400, detail=f"Compose file is not valid:\n{proc.stderr.strip()}")
     try:
-        yaml.safe_load(content)
+        return yaml.safe_load(proc.stdout) or {}, proc.stderr.strip()
     except yaml.YAMLError as e:
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
 
-    with open(compose_file, "wb") as f:
-        f.write(content)
 
-    proc = subprocess.run(
-        ["docker", "compose", "-f", compose_file, "up", "-d"],
-        capture_output=True, text=True,
-        cwd=os.path.dirname(compose_file),
-    )
+@app.get("/api/fs/browse")
+def browse_fs(path: str = ""):
+    p = Path(path).expanduser().resolve() if path else Path.home()
+    if p.is_file():
+        p = p.parent
+    if not p.is_dir():
+        raise HTTPException(status_code=404, detail=f"Folder not found: {p}")
+    try:
+        children = list(p.iterdir())
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"No permission to open {p}")
 
+    entries = []
+    for c in children:
+        if c.name.startswith("."):
+            continue
+        try:
+            is_dir = c.is_dir()
+            if not is_dir and c.suffix.lower() not in COMPOSE_SUFFIXES:
+                continue
+            st = c.stat()
+        except OSError:
+            continue
+        entries.append({
+            "name": c.name,
+            "path": str(c),
+            "type": "dir" if is_dir else "file",
+            "size": st.st_size,
+            "modified": st.st_mtime,
+        })
+    entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
+    return {
+        "host": socket.gethostname(),
+        "path": str(p),
+        "parent": str(p.parent) if p.parent != p else None,
+        "home": str(Path.home()),
+        "entries": entries,
+    }
+
+
+@app.post("/api/stacks/{stack_name}/deploy/preview")
+async def preview_stack_deploy(
+    stack_name: str,
+    path: str = Form(""),
+    file: Optional[UploadFile] = File(None),
+):
+    stack = find_stack(stack_name)
+
+    if file is not None and file.filename:
+        if Path(file.filename).suffix.lower() not in COMPOSE_SUFFIXES:
+            raise HTTPException(status_code=400, detail="Upload a .yml or .yaml file")
+        content = await file.read()
+        try:
+            yaml.safe_load(content)
+        except yaml.YAMLError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
+        target_dir = DEPLOY_DIR / stack_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        compose_path = target_dir / f"{stamp}-{Path(file.filename).name}"
+        compose_path.write_bytes(content)
+        source = "upload"
+    elif path:
+        compose_path = resolve_compose_path(path)
+        source = "server"
+    else:
+        raise HTTPException(status_code=400, detail="Upload a file or pick one on the server")
+
+    rendered, warnings = render_compose(stack, compose_path)
+    new_services = rendered.get("services") or {}
+
+    if stack.get("Type") == "swarm":
+        current = {s["Service"]: s["Image"] for s in get_swarm_services(stack_name)}
+    else:
+        current = get_stack(stack_name).get("service_images") or {}
+
+    services = []
+    for name, cfg in new_services.items():
+        image = strip_digest((cfg or {}).get("image", ""))
+        if name not in current:
+            change = "added"
+        elif image and image != strip_digest(current[name]):
+            change = "changed"
+        else:
+            change = "unchanged"
+        services.append({"name": name, "image": image, "current_image": current.get(name, ""), "change": change})
+    order = {"changed": 0, "added": 1, "unchanged": 2}
+    services.sort(key=lambda s: (order[s["change"]], s["name"]))
+
+    text = compose_path.read_text(errors="replace")
+    return {
+        "stack": stack_name,
+        "type": stack.get("Type"),
+        "path": str(compose_path),
+        "source": source,
+        "services": services,
+        "not_in_file": sorted(set(current) - set(new_services)),
+        "warnings": warnings,
+        "content": text[:200_000],
+        "truncated": len(text) > 200_000,
+    }
+
+
+@app.post("/api/stacks/{stack_name}/deploy")
+def deploy_stack(stack_name: str, path: str = Form(...), prune: bool = Form(False)):
+    stack = find_stack(stack_name)
+    compose_path = resolve_compose_path(path)
+
+    if stack.get("Type") == "swarm":
+        cmd = ["docker", "stack", "deploy", "-c", str(compose_path), "--with-registry-auth"]
+        if prune:
+            cmd.append("--prune")
+        cmd.append(stack_name)
+    else:
+        cmd = compose_cmd(stack, compose_path) + ["up", "-d"]
+        if prune:
+            cmd.append("--remove-orphans")
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=compose_path.parent, timeout=900)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Deploy still running after 15 min — check the stack page")
+
+    output = ANSI_RE.sub("", (proc.stdout + "\n" + proc.stderr).strip())
     if proc.returncode != 0:
-        raise HTTPException(status_code=500, detail=proc.stderr or "Deployment failed")
-
-    return {"success": True, "output": proc.stdout}
+        raise HTTPException(status_code=500, detail=output or "Deploy failed")
+    return {"success": True, "command": " ".join(cmd), "output": output}
 
 
 @app.post("/api/stacks/{stack_name}/services/{service_name}/update-image")
