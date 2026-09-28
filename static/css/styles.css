@@ -544,6 +544,28 @@ tbody td {
 }
 
 .modal-body { padding: 18px 20px; }
+
+/* ── Env viewer ──────────────────────────────────────────────────────────── */
+.modal:has(.env-view) { width: 820px; }
+.env-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+}
+.env-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 32%) 1fr auto;
+  gap: 12px;
+  align-items: start;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+.env-row:last-child { border-bottom: none; }
+.env-row:hover { background: #f5f7ff; }
+.env-key { font-weight: 600; color: var(--text); word-break: break-all; }
+.env-val { color: var(--text); word-break: break-all; white-space: pre-wrap; }
 .modal-footer {
   padding: 14px 20px;
   border-top: 1px solid var(--border-soft);

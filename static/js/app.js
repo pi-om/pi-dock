@@ -389,6 +389,9 @@ function containerRow(c) {
           <button class="btn btn-ghost btn-sm" onclick="openContainerLogs('${escHtml(c.id)}', '${escHtml(c.name)}')">
             Logs
           </button>
+          <button class="btn btn-ghost btn-sm" onclick="openContainerEnv('${escHtml(c.id)}', '${escHtml(c.name)}')">
+            Env
+          </button>
           ${isRunning
             ? `<button class="btn btn-danger btn-sm" onclick="confirmStopContainer('${escHtml(c.id)}', '${escHtml(c.name)}')">Stop</button>`
             : `<button class="btn btn-primary btn-sm" onclick="doStartContainer('${escHtml(c.id)}', '${escHtml(c.name)}')">Start</button>`
@@ -424,6 +427,75 @@ async function openContainerLogs(id, name) {
     const view = $('#ctr-log-view');
     if (view) view.textContent = `Failed to load logs: ${e.message}`;
   }
+}
+
+// Masked until "Show secrets" is ticked: secret-looking names, plus any value with
+// credentials embedded in a URL (postgres://user:pass@host). Names that are just
+// endpoints (…_TOKEN_URL) or counts (…_TOKENS) aren't secrets on their own.
+const SECRET_KEY_RE = /pass(wd|word)?|secret|token|credential|dsn|(^|_)(api|access|private|secret|signing|encryption|master)_?key$|_key$|^key$/i;
+const NOT_SECRET_KEY_RE = /_(url|uri|endpoint|tokens)$/i;
+const URL_CREDENTIALS_RE = /:\/\/[^/\s:@]+:[^@\s]+@/;
+
+function isSecretEnv(e) {
+  return URL_CREDENTIALS_RE.test(e.value) || (SECRET_KEY_RE.test(e.key) && !NOT_SECRET_KEY_RE.test(e.key));
+}
+
+async function openContainerEnv(id, name) {
+  Modal.open(`
+    <div class="modal-header env-view">
+      <span class="modal-title">Env — ${escHtml(name)}</span>
+      <button class="btn-icon" onclick="Modal.close()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="flex items-center gap-2 mb-3">
+        <input class="search-input" id="env-search" placeholder="Search variables…" style="flex:1" />
+        <label class="flex items-center gap-2 text-muted" style="font-size:12px;cursor:pointer;white-space:nowrap">
+          <input type="checkbox" id="env-reveal" /> Show secrets
+        </label>
+      </div>
+      <div class="env-list" id="env-list"><div class="text-muted">Loading…</div></div>
+    </div>
+    <div class="modal-footer">
+      <span class="text-muted mr-auto" id="env-count" style="font-size:12px;margin-right:auto"></span>
+      <button class="btn btn-primary" onclick="Modal.close()">Close</button>
+    </div>
+  `);
+
+  let env;
+  try { env = (await API.containers.env(id)).env; }
+  catch (e) { $('#env-list').innerHTML = `<div style="color:var(--red)">Failed to load env: ${escHtml(e.message)}</div>`; return; }
+
+  window._envVars = env;
+  const render = () => renderEnvList($('#env-search').value.trim().toLowerCase(), $('#env-reveal').checked);
+  $('#env-search').addEventListener('input', render);
+  $('#env-reveal').addEventListener('change', render);
+  render();
+  $('#env-search').focus();
+}
+
+function renderEnvList(q, reveal) {
+  const env = window._envVars || [];
+  // Hidden values stay unsearchable so a search can't be used to probe them
+  const shown = env.filter(e => !q || e.key.toLowerCase().includes(q)
+    || ((reveal || !isSecretEnv(e)) && e.value.toLowerCase().includes(q)));
+  $('#env-count').textContent = q ? `${shown.length} of ${env.length} variables` : `${env.length} variables`;
+  $('#env-list').innerHTML = shown.length ? shown.map(e => {
+    const i = env.indexOf(e);
+    const masked = !reveal && e.value && isSecretEnv(e);
+    return `
+      <div class="env-row">
+        <span class="env-key mono">${escHtml(e.key)}</span>
+        <span class="env-val mono${masked ? ' text-muted' : ''}">${masked ? '••••••••' : escHtml(e.value) || '<span class="text-muted">(empty)</span>'}</span>
+        <button class="btn-icon" title="Copy value" onclick="copyEnvValue(${i})">⧉</button>
+      </div>`;
+  }).join('') : `<div class="text-muted">No variables match.</div>`;
+}
+
+async function copyEnvValue(i) {
+  const e = (window._envVars || [])[i];
+  if (!e) return;
+  try { await navigator.clipboard.writeText(e.value); Toast.success(`Copied ${escHtml(e.key)}`); }
+  catch { Toast.error('Clipboard not available'); }
 }
 
 function confirmStopContainer(id, name) {
@@ -693,6 +765,7 @@ async function renderServiceDetail({ name, service }) {
               <option value="5000">Last 5000 lines</option>
             </select>
             <button class="btn btn-ghost btn-sm" onclick="loadServiceLogs('${escHtml(latest.container_id)}')">⟳ Refresh logs</button>
+            <button class="btn btn-ghost btn-sm" onclick="openContainerEnv('${escHtml(latest.container_id)}', '${escHtml(latest.name + ' · ' + latest.container_id.slice(0, 12))}')">Env</button>
           </div>
           <div class="pull-output" id="svc-log-view" style="max-height:460px">Loading logs…</div>`}
       </div>
@@ -737,7 +810,10 @@ function historyRow(c, isLatest) {
       <td><span class="text-muted" style="font-size:12px" title="${escHtml(msg)}">${escHtml(msg || '—')}</span></td>
       <td style="text-align:right">
         ${c.exists
-          ? `<button class="btn btn-ghost btn-sm" onclick="openContainerLogs('${escHtml(c.container_id)}', '${escHtml(c.name + ' · ' + shortId)}')">Logs</button>`
+          ? `<div class="flex gap-2" style="justify-content:flex-end">
+              <button class="btn btn-ghost btn-sm" onclick="openContainerLogs('${escHtml(c.container_id)}', '${escHtml(c.name + ' · ' + shortId)}')">Logs</button>
+              <button class="btn btn-ghost btn-sm" onclick="openContainerEnv('${escHtml(c.container_id)}', '${escHtml(c.name + ' · ' + shortId)}')">Env</button>
+            </div>`
           : `<span class="text-muted" style="font-size:11px" title="Container was removed from this node">removed</span>`}
       </td>
     </tr>`;

@@ -43,6 +43,7 @@ const API = {
   containers: {
     list: () => API.get('/api/containers'),
     logs: (id, tail = 300) => API.get(`/api/containers/${encodeURIComponent(id)}/logs?tail=${tail}`),
+    env: (id) => API.get(`/api/containers/${encodeURIComponent(id)}/env`),
     stop: (id) => API.post(`/api/containers/${encodeURIComponent(id)}/stop`, {}),
     start: (id) => API.post(`/api/containers/${encodeURIComponent(id)}/start`, {}),
   },

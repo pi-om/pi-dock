@@ -228,6 +228,21 @@ def get_container_logs(container_id: str, tail: int = 300):
     return {"logs": ANSI_RE.sub("", text)}
 
 
+@app.get("/api/containers/{container_id}/env")
+def get_container_env(container_id: str):
+    client = docker_client()
+    try:
+        container = client.containers.get(container_id)
+    except docker.errors.NotFound:
+        raise HTTPException(status_code=404, detail="Container not found")
+
+    env = []
+    for entry in container.attrs.get("Config", {}).get("Env") or []:
+        key, _, value = entry.partition("=")
+        env.append({"key": key, "value": value})
+    return {"name": container.name, "env": sorted(env, key=lambda e: e["key"])}
+
+
 @app.post("/api/containers/{container_id}/stop")
 def stop_container(container_id: str):
     client = docker_client()
