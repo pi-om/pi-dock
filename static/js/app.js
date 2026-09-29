@@ -744,6 +744,10 @@ function serviceRow(stackName, svcName, currentImage, status) {
       </div>
       <div class="service-image" title="${escHtml(currentImage)}">${escHtml(currentImage || '—')}</div>
       <button class="btn btn-ghost btn-sm"
+        onclick="event.stopPropagation();confirmRestartService('${escHtml(stackName)}', '${escHtml(svcName)}', ${status?.Replicas !== undefined})">
+        ⟲ Restart
+      </button>
+      <button class="btn btn-ghost btn-sm"
         onclick="event.stopPropagation();openUpdateImage('${escHtml(stackName)}', '${escHtml(svcName)}', '${escHtml(currentImage)}')">
         Update Image
       </button>
@@ -786,6 +790,7 @@ async function renderServiceDetail({ name, service }) {
       </div>
       <div class="ml-auto flex gap-2">
         <button class="btn btn-ghost btn-sm" onclick="renderServiceDetail({ name: '${escHtml(name)}', service: '${escHtml(service)}' })">⟳ Refresh</button>
+        <button class="btn btn-ghost btn-sm" onclick="confirmRestartService('${escHtml(name)}', '${escHtml(service)}', ${svc.type === 'swarm'})">⟲ Restart</button>
         <button class="btn btn-primary btn-sm" onclick="openUpdateImage('${escHtml(name)}', '${escHtml(service)}', '${escHtml(image)}')">Update Image</button>
       </div>
     </div>
@@ -889,6 +894,53 @@ async function loadServiceLogs(containerId) {
     view.scrollTop = view.scrollHeight;
   } catch (e) {
     view.textContent = `Failed to load logs: ${e.message}`;
+  }
+}
+
+// ── Restart service ───────────────────────────────────────────────────────────
+
+function confirmRestartService(stackName, serviceName, isSwarm) {
+  const cmd = isSwarm
+    ? `docker service update --force ${stackName}_${serviceName}`
+    : `docker restart <${stackName} ${serviceName} containers>`;
+  Modal.open(`
+    <div class="modal-header">
+      <span class="modal-title">Restart ${escHtml(serviceName)}</span>
+      <button class="btn-icon" onclick="Modal.close()">✕</button>
+    </div>
+    <div class="modal-body" id="restart-body">
+      <p style="font-size:13px;margin-bottom:10px">
+        Restart <strong>${escHtml(serviceName)}</strong> in <strong>${escHtml(stackName)}</strong>?
+        ${isSwarm
+          ? 'Swarm replaces its containers with fresh ones using the same image and config. A single-replica service is briefly unavailable.'
+          : 'Its containers are stopped and started again.'}
+      </p>
+      <div class="pull-output" style="max-height:none">$ ${escHtml(cmd)}</div>
+    </div>
+    <div class="modal-footer" id="restart-footer">
+      <button class="btn btn-ghost" onclick="Modal.close()">Cancel</button>
+      <button class="btn btn-danger" id="restart-go">⟲ Restart</button>
+    </div>
+  `);
+  $('#restart-go').onclick = () => doRestartService(stackName, serviceName);
+}
+
+async function doRestartService(stackName, serviceName) {
+  const body = $('#restart-body');
+  const footer = $('#restart-footer');
+  body.innerHTML = `<div class="loading-state"><div class="spinner"></div>Restarting ${escHtml(serviceName)} — waiting for the new containers to come up…</div>`;
+  footer.innerHTML = '';
+  try {
+    const res = await API.stacks.restartService(stackName, serviceName);
+    Toast.success(`Restarted ${escHtml(serviceName)}`);
+    Modal.close();
+    Router._dispatch(location.pathname);
+  } catch (e) {
+    body.innerHTML = `
+      <div style="color:var(--red);font-weight:600;margin-bottom:8px">✕ Restart failed</div>
+      <div class="pull-output" style="color:#f87171;max-height:300px">${escHtml(e.message)}</div>`;
+    footer.innerHTML = `<button class="btn btn-primary" onclick="Modal.close();Router._dispatch(location.pathname)">Close</button>`;
+    Toast.error(`Restart of ${escHtml(serviceName)} failed`);
   }
 }
 

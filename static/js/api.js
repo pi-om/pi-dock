@@ -78,6 +78,8 @@ const API = {
         fd, true
       );
     },
+    restartService: (stackName, serviceName) => API.post(
+      `/api/stacks/${encodeURIComponent(stackName)}/services/${encodeURIComponent(serviceName)}/restart`, {}),
     downloadComposeUrl: (name) => `/api/stacks/${encodeURIComponent(name)}/compose/download`,
   },
 };

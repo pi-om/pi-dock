@@ -842,6 +842,41 @@ def update_swarm_service_image(stack_name: str, service_name: str, image: str):
     return {"success": True, "type": "swarm", "pull_output": "", "deploy_output": deploy.stdout}
 
 
+@app.post("/api/stacks/{stack_name}/services/{service_name}/restart")
+def restart_stack_service(stack_name: str, service_name: str):
+    stack = find_stack(stack_name)
+
+    if stack.get("Type") == "swarm":
+        full_name = f"{stack_name}_{service_name}"
+        if not any(s["Name"] == full_name for s in get_swarm_services(stack_name)):
+            raise HTTPException(status_code=404, detail="Service not found in stack")
+        # --detach=false waits until the new tasks are running so a failed restart is reported
+        cmd = ["docker", "service", "update", "--force", "--detach=false", "--quiet", full_name]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=408, detail="Restart still converging after 10 min — check the service page")
+        if proc.returncode != 0:
+            raise HTTPException(status_code=500, detail=proc.stderr or proc.stdout or "Service restart failed")
+        return {"success": True, "command": " ".join(cmd), "output": ANSI_RE.sub("", proc.stdout).strip()}
+
+    client = docker_client()
+    containers = client.api.containers(all=True, filters={"label": [
+        f"com.docker.compose.project={stack_name}",
+        f"com.docker.compose.service={service_name}",
+    ]})
+    if not containers:
+        raise HTTPException(status_code=404, detail="No containers found for this service")
+    names = []
+    for c in containers:
+        try:
+            client.api.restart(c["Id"], timeout=10)
+        except docker.errors.APIError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        names.append((c.get("Names") or ["/" + c["Id"][:12]])[0].lstrip("/"))
+    return {"success": True, "command": "docker restart " + " ".join(names), "output": ""}
+
+
 @app.get("/api/stacks/{stack_name}/compose/download")
 def download_compose(stack_name: str):
     stack = find_stack(stack_name)
